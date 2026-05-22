@@ -141,10 +141,14 @@ custom_colors <- c(
 p <- ggplot(data, aes(x = logFC, y = negLog10AdjP)) +
   # 基础散点层
   geom_point(aes(color = Significance), alpha = 0.6, size = 1.5) +
-  # 目标基因高亮层
+  # 目标基因高亮层 - 铜死亡基因加粗加大，带半透明光晕
   geom_point(
     data = filter(data, IsTarget == "Cuproptosis Gene"),
-    color = "#0072B2", size = 3, alpha = 0.9
+    color = "#0072B2", size = 4.5, alpha = 0.3
+  ) +
+  geom_point(
+    data = filter(data, IsTarget == "Cuproptosis Gene"),
+    color = "#0072B2", size = 3, alpha = 0.95
   ) +
   # 阈值线
   geom_vline(xintercept = c(-log2fc_cutoff, log2fc_cutoff), linetype = "dashed", color = "gray40", linewidth = 0.8) +
@@ -196,22 +200,25 @@ p <- ggplot(data, aes(x = logFC, y = negLog10AdjP)) +
   ) +
   # 添加标题
   ggtitle("GSE61616: Differential Expression Analysis") +
-  # 添加统计信息注释
+  # 统计信息注释 - 放在右侧，不遮挡数据
   annotate(
     "text",
-    x = max(data[["logFC"]], na.rm = TRUE) * 0.7,
-    y = max(data[["negLog10AdjP"]], na.rm = TRUE) * 0.95,
+    x = max(data[["logFC"]], na.rm = TRUE) * 0.95,
+    y = max(data[["negLog10AdjP"]], na.rm = TRUE) * 0.15,
     label = paste0(
       "Up: ", sum(data[["Significance"]] == "Up-regulated", na.rm = TRUE), "\n",
       "Down: ", sum(data[["Significance"]] == "Down-regulated", na.rm = TRUE), "\n",
-      "Cuproptosis: ", length(genes_in_data), "/35\n",
-      "Labeled: Top 50 + Cuproptosis"
+      "Cuproptosis: ", length(genes_in_data), "/35"
     ),
     hjust = 1,
-    vjust = 1,
-    size = 4,
+    vjust = 0,
+    size = 4.5,
     fontface = "bold",
     color = "black"
+  ) +
+  # 右侧边框加粗，突出图例区域
+  theme(
+    plot.margin = margin(0.5, 1.2, 0.5, 0.5, "cm")
   )
 
 # 5. 保存图像 ----
