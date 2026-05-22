@@ -1,0 +1,76 @@
+# .gitignore for CIRI-cuproptosis-causal-discovery
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+.venv/
+env/
+.ENV
+
+# R
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj.user
+.Rproj.user/
+
+# Results and figures (keep in local, not in git)
+results/
+figures/
+
+# Data (too large for git)
+data/
+*.h5ad
+*.loom
+*.rds
+*.Rds
+*.csv
+*.tsv
+*.gz
+*.zip
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Models
+models/
+*.pt
+*.pth
+*.ckpt
+
+# Temporary files
+*.tmp
+temp/
