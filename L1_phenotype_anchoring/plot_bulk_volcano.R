@@ -115,12 +115,18 @@ message("人类-小鼠基因映射已保存至：", mapping_file)
 # 标记目标基因
 data[["IsTarget"]] <- ifelse(data[["Gene"]] %in% genes_in_data, "Cuproptosis Gene", "Other")
 
-# 提取用于标签显示的基因：目标基因 + 极显著基因 (adj.P.Val < 0.001 且 |log2FC| > 1)
-label_data <- data %>%
-  filter(
-    IsTarget == "Cuproptosis Gene" |
-    (adj.P.Val < 0.001 & abs(logFC) > 1)
-  ) %>%
+# 提取用于标签显示的基因：所有铜死亡基因 + Top 50 最显著非铜死亡基因
+top50 <- data %>%
+  filter(!Gene %in% genes_in_data) %>%
+  arrange(adj.P.Val) %>%
+  head(50) %>%
+  mutate(LabelType = "Top 50 Significant")
+
+cupro_data <- data %>%
+  filter(Gene %in% genes_in_data) %>%
+  mutate(LabelType = "Cuproptosis Gene")
+
+label_data <- bind_rows(cupro_data, top50) %>%
   distinct(Gene, .keep_all = TRUE)
 
 # 4. 绘图 ----
@@ -143,18 +149,29 @@ p <- ggplot(data, aes(x = logFC, y = negLog10AdjP)) +
   # 阈值线
   geom_vline(xintercept = c(-log2fc_cutoff, log2fc_cutoff), linetype = "dashed", color = "gray40", linewidth = 0.8) +
   geom_hline(yintercept = -log10(adj_p_cutoff), linetype = "dashed", color = "gray40", linewidth = 0.8) +
-  # 基因标签 (使用ggrepel避免重叠)
+  # 基因标签 - 铜死亡基因蓝色粗体，Top50 黑色
   geom_text_repel(
-    data = label_data,
+    data = filter(label_data, LabelType == "Cuproptosis Gene"),
     aes(label = Gene),
     color = "#0072B2",
     size = 3.5,
     fontface = "bold",
     max.overlaps = 50,
-    box.padding = 0.3,
-    point.padding = 0.2,
+    box.padding = 0.35,
+    point.padding = 0.25,
     segment.color = "#0072B2",
     segment.alpha = 0.5
+  ) +
+  geom_text_repel(
+    data = filter(label_data, LabelType == "Top 50 Significant"),
+    aes(label = Gene),
+    color = "#333333",
+    size = 3,
+    max.overlaps = 50,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    segment.color = "#999999",
+    segment.alpha = 0.3
   ) +
   # 颜色映射
   scale_color_manual(values = custom_colors) +
@@ -187,7 +204,8 @@ p <- ggplot(data, aes(x = logFC, y = negLog10AdjP)) +
     label = paste0(
       "Up: ", sum(data[["Significance"]] == "Up-regulated", na.rm = TRUE), "\n",
       "Down: ", sum(data[["Significance"]] == "Down-regulated", na.rm = TRUE), "\n",
-      "Targets: ", length(genes_in_data)
+      "Cuproptosis: ", length(genes_in_data), "/35\n",
+      "Labeled: Top 50 + Cuproptosis"
     ),
     hjust = 1,
     vjust = 1,
