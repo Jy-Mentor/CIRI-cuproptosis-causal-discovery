@@ -74,3 +74,4 @@ models/
 # Temporary files
 *.tmp
 temp/
+Rplots.pdf

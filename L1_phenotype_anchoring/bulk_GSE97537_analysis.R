@@ -166,7 +166,7 @@ for (i in seq_len(nrow(cupro_results))) {
     cupro_results$P.Value[i] <- formatC(row$P.Value, format="e", digits=3)
     cupro_results$adj.P.Val[i] <- formatC(row$adj.P.Val, format="e", digits=3)
     cupro_results$Direction[i] <- ifelse(row$logFC > 0, "上调", "下调")
-    cupro_results$Significant[i] <- ifelse(row$adj.P.Val < 0.05, "是", "否")
+    cupro_results$Significant[i] <- ifelse(row$adj.P.Val < 0.05 & abs(row$logFC) >= 0.585, "是", "否")
     cupro_results$AveExpr[i] <- round(row$AveExpr, 3)
     cupro_results$t_value[i] <- round(row$t, 3)
   }
