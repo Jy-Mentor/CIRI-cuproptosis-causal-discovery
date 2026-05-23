@@ -697,12 +697,12 @@ p3_final <- p_anno_seg + p_main +
 
 # ---- 3j. 保存 ----
 fig3_file <- file.path(output_dir, "Fig3_celltype_dotplot.png")
-ggsave(fig3_file, p3_final, width = 14, height = 10, dpi = 600)
+ggsave(fig3_file, p3_final, width = 14, height = 12, dpi = 600)
 cat("  已保存:", fig3_file, "\n")
 
 # PDF版
 fig3_pdf <- file.path(output_dir, "Fig3_celltype_dotplot.pdf")
-ggsave(fig3_pdf, p3_final, width = 14, height = 10, dpi = 300, device = cairo_pdf)
+ggsave(fig3_pdf, p3_final, width = 14, height = 12, dpi = 300, device = cairo_pdf)
 cat("  已保存:", fig3_pdf, "\n")
 
 # =============================================================================
