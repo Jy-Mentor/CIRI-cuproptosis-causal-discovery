@@ -581,16 +581,10 @@ p_main <- ggplot(dot_long, aes(x = cell_type, y = gene)) +
     aes(x = cell_type, y = y_top, color = cell_type),
     size = 3.5, shape = 16, alpha = 0.9
   ) +
-  # 基础气泡层
+  # 统一气泡层: 所有气泡同一细黑边框
   geom_point(
     aes(size = pct, fill = avg.exp.scaled),
-    shape = 21, color = "black", stroke = 0.3
-  ) +
-  # 显著差异基因: 加粗黑边框
-  geom_point(
-    data = dot_long %>% filter(significant == TRUE),
-    aes(size = pct),
-    shape = 21, color = "black", stroke = 1.4, fill = NA
+    shape = 21, color = "black", stroke = 0.5
   ) +
   # 分面: 左=Sham, 右=MCAO
   facet_grid(~ condition, scales = "free_x", space = "free_x") +
@@ -628,8 +622,8 @@ p_main <- ggplot(dot_long, aes(x = cell_type, y = gene)) +
     panel.grid.minor = element_blank(),
     panel.background = element_blank(),
     axis.text.y = element_text(
-      face = "bold.italic", size = 9, colour = "black",
-      margin = margin(r = 5)
+      face = "bold.italic", size = 10, colour = "black",
+      margin = margin(r = 8)
     ),
     axis.text.x = element_blank(),
     axis.ticks.x = element_blank(),
@@ -638,18 +632,18 @@ p_main <- ggplot(dot_long, aes(x = cell_type, y = gene)) +
     axis.ticks.y = element_line(colour = "black", linewidth = 0.4),
     axis.ticks.length.y = unit(0.15, "cm"),
     strip.background = element_rect(fill = "grey95", color = "black", linewidth = 0.4),
-    strip.text = element_text(size = 12, face = "bold", colour = "black"),
+    strip.text = element_text(size = 13, face = "bold", colour = "black"),
     legend.position = "bottom",
     legend.box = "vertical",
     legend.key.width = unit(0.8, "cm"),
     legend.key.height = unit(0.3, "cm"),
-    legend.spacing = unit(0.1, "cm"),
-    legend.text = element_text(size = 9, colour = "black"),
-    legend.title = element_text(size = 10, face = "bold", colour = "black"),
-    plot.margin = margin(0.3, 0.5, 0.3, 0.2, "cm"),
+    legend.spacing = unit(0.15, "cm"),
+    legend.text = element_text(size = 10, colour = "black"),
+    legend.title = element_text(size = 11, face = "bold", colour = "black"),
+    plot.margin = margin(0.4, 0.5, 0.4, 0.3, "cm"),
     panel.spacing = unit(0.6, "lines"),
-    plot.title = element_text(size = 13, face = "bold", hjust = 0.5, margin = margin(b = 4)),
-    plot.subtitle = element_text(size = 9, hjust = 0.5, colour = "gray40", margin = margin(b = 2))
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5, margin = margin(b = 6)),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, colour = "gray40", margin = margin(b = 4))
   )
 
 # ---- 3h. 生成左侧基因分类色条 (segments风格) ----
