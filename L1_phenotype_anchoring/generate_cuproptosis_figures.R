@@ -25,8 +25,11 @@ install_if_missing <- function(pkgs) {
 
 pkgs <- c("ggplot2", "ggrepel", "dplyr", "tidyr", "pheatmap",
           "RColorBrewer", "scales", "grid", "gridExtra", "viridis",
-          "patchwork")
+          "patchwork", "showtext")
 install_if_missing(pkgs)
+
+# 启用 showtext 自动处理中文/Unicode字体渲染 (PDF/PNG通用)
+showtext_auto()
 
 # =============================================================================
 # 2. 定义路径
@@ -640,10 +643,10 @@ p_main <- ggplot(dot_long, aes(x = cell_type, y = gene)) +
     legend.spacing = unit(0.15, "cm"),
     legend.text = element_text(size = 10, colour = "black"),
     legend.title = element_text(size = 11, face = "bold", colour = "black"),
-    plot.margin = margin(0.4, 0.5, 0.4, 0.3, "cm"),
-    panel.spacing = unit(0.6, "lines"),
-    plot.title = element_text(size = 15, face = "bold", hjust = 0.5, margin = margin(b = 6)),
-    plot.subtitle = element_text(size = 11, hjust = 0.5, colour = "gray40", margin = margin(b = 4))
+    plot.margin = margin(0.5, 1.2, 1.5, 0.5, "cm"),
+    panel.spacing = unit(0.8, "lines"),
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5, margin = margin(b = 8)),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, colour = "gray40", margin = margin(b = 6))
   )
 
 # ---- 3h. 生成左侧基因分类色条 (segments风格) ----
