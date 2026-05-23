@@ -297,14 +297,14 @@ p1 <- ggplot() +
       override.aes = list(size = 3, shape = 21, color = "black"))
   )
 
-# 保存
+# 保存 (宽扁比例, Nature Communications标准)
 fig1_file <- file.path(output_dir, "Fig1_bulk_volcano_GSE97537.png")
-ggsave(fig1_file, p1, width = 10, height = 8, dpi = 600)
+ggsave(fig1_file, p1, width = 14, height = 7, dpi = 600)
 cat("  已保存:", fig1_file, "\n")
 
 # 同时保存PDF矢量版
 fig1_pdf <- file.path(output_dir, "Fig1_bulk_volcano_GSE97537.pdf")
-ggsave(fig1_pdf, p1, width = 10, height = 8, dpi = 300, device = cairo_pdf)
+ggsave(fig1_pdf, p1, width = 14, height = 7, dpi = 300, device = cairo_pdf)
 cat("  已保存:", fig1_pdf, "\n")
 
 # =============================================================================
@@ -460,119 +460,176 @@ cat("  已保存:", fig2_pdf, "\n")
 
 # =============================================================================
 # Fig 3: 各亚群差异小提琴图 (关键铜死亡基因)
+#   修复要点:
+#     1. 基因选择: mean(|log2FC|) * n_sig_celltypes 综合评分排序
+#     2. 效应大小标注: 仅当 |log2FC| > 0.25 且 p < 0.05 才显示显著性星号
+#     3. 可视化: 小提琴 + 箱线图 + 均值点 + 95%CI 误差线 (无散点, 更干净)
+#     4. 不显著的组合不做任何标注
 # =============================================================================
-cat("\n>>> 绘制 Fig3: 关键基因小提琴图...\n")
+cat("\n>>> 绘制 Fig3: 关键基因小提琴图 (效应大小过滤版)...\n")
 
-# 确定最显著的8个基因: 在最多细胞类型中 p_adjust < 0.05 的基因
-gene_sig_count <- ct_deg %>%
-  filter(p_adjust < 0.05) %>%
+# ---- 4a. 综合评分选择前8个基因 ----
+# 评分公式: mean(|log2FC|) * n_sig_celltypes
+#   - mean(|log2FC|): 跨细胞类型平均绝对效应大小
+#   - n_sig_celltypes: |log2FC|>0.25 且 p_adjust<0.05 的细胞类型数
+gene_composite <- ct_deg %>%
   group_by(gene) %>%
-  summarise(n_sig_celltypes = n_distinct(cell_type), .groups = "drop") %>%
-  arrange(desc(n_sig_celltypes))
+  summarise(
+    mean_abs_lfc = mean(abs(log2FC), na.rm = TRUE),
+    n_sig = sum(abs(log2FC) > 0.25 & p_adjust < 0.05, na.rm = TRUE),
+    composite_score = mean_abs_lfc * n_sig,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(composite_score))
 
-cat("  基因显著性排名（跨细胞类型）:\n")
-print(gene_sig_count, n = 15)
+cat("  基因综合评分排名:\n")
+print(gene_composite, n = 15)
 
-# 选择前8个基因
 top_n_genes <- 8
-if (nrow(gene_sig_count) < top_n_genes) {
-  top_n_genes <- nrow(gene_sig_count)
+if (nrow(gene_composite) < top_n_genes) {
+  top_n_genes <- nrow(gene_composite)
 }
-top_genes <- gene_sig_count[["gene"]][seq_len(top_n_genes)]
+top_genes <- gene_composite[["gene"]][seq_len(top_n_genes)]
 cat("  选择前", top_n_genes, "个基因:", paste(top_genes, collapse = ", "), "\n")
 
-# 如果显著基因不足8个，补充其他基因
-if (length(top_genes) < 8) {
-  # 补充差异最大的基因（按|log2FC|排序）
-  remaining <- ct_deg %>%
-    filter(!gene %in% top_genes) %>%
-    group_by(gene) %>%
-    summarise(max_abs_lfc = max(abs(log2FC), na.rm = TRUE), .groups = "drop") %>%
-    arrange(desc(max_abs_lfc)) %>%
-    head(8 - length(top_genes))
-  top_genes <- c(top_genes, remaining[["gene"]])
-  cat("  补充基因:", paste(remaining[["gene"]], collapse = ", "), "\n")
-}
-
-# 过滤小提琴数据
+# ---- 4b. 过滤小提琴数据 ----
 vio_sub <- vio_data[vio_data[["gene"]] %in% top_genes, ]
-stopifnot(nrow(vio_sub) > 0)
+stopifnot("vio_sub is empty after gene filtering" = nrow(vio_sub) > 0)
 cat("  小提琴数据行数:", nrow(vio_sub), "\n")
 
 # 确保condition为因子
 vio_sub[["condition"]] <- factor(vio_sub[["condition"]], levels = c("Sham", "MCAO"))
 
-# 为每个基因在每个细胞类型中计算wilcox p值
-stat_results <- vio_sub %>%
+# 设置基因因子顺序
+vio_sub[["gene"]] <- factor(vio_sub[["gene"]], levels = top_genes)
+
+# ---- 4c. 效应大小过滤的统计标注 ----
+# 步骤1: 计算每个基因-细胞类型-条件的均值(用于log2FC)和进行Wilcoxon检验
+# 注意: expression已经是log1p标准化, 因此 MCAO_mean - Sham_mean ≈ log2FC
+stat_raw <- vio_sub %>%
+  group_by(gene, cell_type, condition) %>%
+  summarise(
+    mean_expr = mean(expression, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 转换为宽格式计算效应大小
+stat_effects <- stat_raw %>%
+  pivot_wider(names_from = condition, values_from = mean_expr) %>%
+  mutate(effect_log2FC = MCAO - Sham)  # log1p空间差值 ≈ log2FC
+
+# 步骤2: Wilcoxon检验
+stat_pvals <- vio_sub %>%
   group_by(gene, cell_type) %>%
   summarise(
     p_val = tryCatch({
-      test <- wilcox.test(expression ~ condition, data = pick(1L))
+      # 提取当前分组数据
+      sub_data <- vio_sub[vio_sub[["gene"]] == unique(gene) &
+                          vio_sub[["cell_type"]] == unique(cell_type), ]
+      test <- wilcox.test(expression ~ condition, data = sub_data)
       test[["p.value"]]
     }, error = function(e) NA_real_),
     .groups = "drop"
-  ) %>%
+  )
+
+# 步骤3: 合并效应大小和p值, 应用效应大小过滤
+#   - 仅当 |log2FC| > 0.25 且 p < 0.05 才标注
+#   - 不标注 "ns"
+stat_results <- stat_effects %>%
+  left_join(stat_pvals, by = c("gene", "cell_type")) %>%
   mutate(
+    # 效应大小过滤核心逻辑
+    show_star = abs(effect_log2FC) > 0.25 & !is.na(p_val) & p_val < 0.05,
     p_label = case_when(
-      is.na(p_val) ~ "",
-      p_val < 0.001 ~ "***",
-      p_val < 0.01  ~ "**",
-      p_val < 0.05  ~ "*",
-      TRUE ~ "ns"
+      !show_star                      ~ "",     # 不显著或效应太小 → 不标注
+      p_val < 0.001                   ~ "***",
+      p_val < 0.01                    ~ "**",
+      p_val < 0.05                    ~ "*",
+      TRUE                            ~ ""      # 不显示"ns"
     ),
-    # 注释位置: 在每组最大值上方
     p_y = NA_real_
   )
 
-# 计算每个面板的最大值用于注释位置
-max_expr <- vio_sub %>%
+# 步骤4: 基于95%CI上界计算标注y位置
+ci_upper_data <- vio_sub %>%
+  group_by(gene, cell_type, condition) %>%
+  summarise(
+    n = n(),
+    mean_expr = mean(expression, na.rm = TRUE),
+    sd_expr = sd(expression, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    se = sd_expr / sqrt(n),
+    ci_upper = mean_expr + 1.96 * se
+  ) %>%
   group_by(gene, cell_type) %>%
-  summarise(max_val = max(expression, na.rm = TRUE), .groups = "drop")
+  summarise(max_ci_upper = max(ci_upper, na.rm = TRUE), .groups = "drop")
 
 stat_results <- stat_results %>%
-  left_join(max_expr, by = c("gene", "cell_type")) %>%
-  mutate(p_y = max_val * 1.1 + 0.1)
+  left_join(ci_upper_data, by = c("gene", "cell_type")) %>%
+  mutate(p_y = max_ci_upper * 1.15 + 0.05)
 
-# 设置基因因子顺序（按显著性排序）
-vio_sub[["gene"]] <- factor(vio_sub[["gene"]], levels = top_genes)
+# 统计标注数量
+n_annotations <- sum(stat_results[["show_star"]], na.rm = TRUE)
+cat("  效应大小过滤后标注数:", n_annotations, "/", nrow(stat_results), "\n")
 
-# 调整细胞类型顺序（按表达模式聚类，但保持可读性）
-# 按第一个基因的表达均值排序
+# ---- 4d. 细胞类型排序 ----
+# 按第一个基因的Sham组表达均值排序
 first_gene <- top_genes[1]
 ct_order <- vio_sub %>%
-  filter(gene == first_gene) %>%
+  filter(gene == first_gene, condition == "Sham") %>%
   group_by(cell_type) %>%
   summarise(mean_expr = mean(expression, na.rm = TRUE), .groups = "drop") %>%
   arrange(desc(mean_expr))
 vio_sub[["cell_type"]] <- factor(vio_sub[["cell_type"]],
   levels = ct_order[["cell_type"]])
 
-# 自定义颜色
+# ---- 4e. 计算均值和95%CI数据(用于绘图) ----
+mean_ci <- vio_sub %>%
+  group_by(gene, cell_type, condition) %>%
+  summarise(
+    mean_expr = mean(expression, na.rm = TRUE),
+    sd_expr = sd(expression, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    se = sd_expr / sqrt(n),
+    ci_lower = mean_expr - 1.96 * se,
+    ci_upper = mean_expr + 1.96 * se
+  )
+
+# ---- 4f. 自定义配色 ----
 condition_colors <- c("Sham" = "#4DAF4A", "MCAO" = "#E41A1C")
 
-# 计算分面中的最大y值，用于统一y轴范围
-y_max_all <- max(vio_sub[["expression"]], na.rm = TRUE) * 1.3
-
+# ---- 4g. 绘制 ----
 p3 <- ggplot(vio_sub, aes(x = cell_type, y = expression, fill = condition)) +
-  # 小提琴
-  geom_violin(trim = TRUE, scale = "width", alpha = 0.7,
+  # 小提琴 (半透明, 黑色描边)
+  geom_violin(trim = TRUE, scale = "width", alpha = 0.55,
     position = position_dodge(width = 0.8), color = "black", linewidth = 0.3) +
-  # 箱线图内嵌
-  geom_boxplot(width = 0.15, position = position_dodge(width = 0.8),
-    alpha = 0.9, outlier.shape = NA, color = "black", linewidth = 0.3) +
-  # 散点（抖动）
-  geom_jitter(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8),
-    size = 0.3, alpha = 0.2, color = "grey30") +
-  # 分面
+  # 箱线图内嵌 (窄宽度, 不显示异常值)
+  geom_boxplot(width = 0.12, position = position_dodge(width = 0.8),
+    alpha = 0.85, outlier.shape = NA, color = "black", linewidth = 0.3) +
+  # 均值点 + 95%CI 误差线 (干净的专业展示, 无散点)
+  geom_pointrange(
+    data = mean_ci,
+    aes(x = cell_type, y = mean_expr,
+        ymin = ci_lower, ymax = ci_upper,
+        group = condition),
+    position = position_dodge(width = 0.8),
+    size = 0.6, linewidth = 0.5, color = "black"
+  ) +
+  # 分面 (自由Y轴刻度, 每个基因独立)
   facet_wrap(~ gene, nrow = 2, scales = "free_y") +
   # 颜色
   scale_fill_manual(values = condition_colors, name = "Condition") +
-  # 统计注释
+  # 效应大小过滤后的统计标注 (只显示有意义的星号)
   geom_text(
-    data = stat_results,
+    data = stat_results[stat_results[["show_star"]] == TRUE, ],
     aes(x = cell_type, y = p_y, label = p_label),
     inherit.aes = FALSE,
-    size = 3, vjust = 0.5, color = "black", fontface = "bold"
+    size = 3.5, vjust = 0.5, color = "black", fontface = "bold"
   ) +
   # 标签
   labs(
@@ -593,12 +650,12 @@ p3 <- ggplot(vio_sub, aes(x = cell_type, y = expression, fill = condition)) +
 
 # 保存
 fig3_file <- file.path(output_dir, "Fig3_celltype_violin.png")
-ggsave(fig3_file, p3, width = 14, height = 10, dpi = 600)
+ggsave(fig3_file, p3, width = 14, height = 12, dpi = 600)
 cat("  已保存:", fig3_file, "\n")
 
 # PDF版
 fig3_pdf <- file.path(output_dir, "Fig3_celltype_violin.pdf")
-ggsave(fig3_pdf, p3, width = 14, height = 10, dpi = 300, device = cairo_pdf)
+ggsave(fig3_pdf, p3, width = 14, height = 12, dpi = 300, device = cairo_pdf)
 cat("  已保存:", fig3_pdf, "\n")
 
 # =============================================================================
@@ -608,7 +665,7 @@ cat("\n", paste(rep("=", 60), collapse = ""), "\n", sep = "")
 cat("所有图表已生成完毕！\n")
 cat("输出目录:", output_dir, "\n")
 cat("生成文件:\n")
-cat("  1. Fig1_bulk_volcano_GSE97537.png (10x8\", 600dpi)\n")
+cat("  1. Fig1_bulk_volcano_GSE97537.png (14x7\", 600dpi) - 宽扁火山图\n")
 cat("  2. Fig2_celltype_cuproptosis_heatmap.png (12x", round(fig_height, 1), "\", 600dpi)\n", sep = "")
-cat("  3. Fig3_celltype_violin.png (14x10\", 600dpi)\n")
+cat("  3. Fig3_celltype_violin.png (14x12\", 600dpi) - 效应大小过滤, 小提琴+箱线图+均值+95%CI\n")
 cat(paste(rep("=", 60), collapse = ""), "\n")
