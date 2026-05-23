@@ -170,6 +170,9 @@ cat("    -> 总行数:", nrow(ct_deg), "\n")
 cat("    -> 细胞类型:", paste(unique(ct_deg[["cell_type"]]), collapse = ", "), "\n")
 cat("    -> 基因数:", length(unique(ct_deg[["gene"]])), "\n")
 
+# 排除未分类细胞
+ct_deg <- ct_deg %>% filter(cell_type != "Unknown")
+
 # 7.4 读取小提琴图数据
 cat("  读取小提琴图数据:", violin_data_file, "\n")
 vio_data <- read.csv(violin_data_file, stringsAsFactors = FALSE)
@@ -177,6 +180,13 @@ stopifnot(nrow(vio_data) > 0)
 cat("    -> 总行数:", nrow(vio_data), "\n")
 
 cat(">>> 数据读取完成\n")
+
+# =============================================================================
+# 全局排序定义
+# =============================================================================
+# 细胞类型顺序
+ct_order <- c("Neuron", "OPC", "Oligodendrocyte", "Astrocyte",
+              "Microglia", "Pericyte", "Endothelial", "Ependymal")
 
 # =============================================================================
 # Fig 1: Bulk火山图 (GSE97537)
@@ -345,6 +355,9 @@ heat_matrix[["gene"]] <- NULL
 heat_matrix <- as.matrix(heat_matrix)
 mode(heat_matrix) <- "numeric"
 
+# 按 ct_order 重新排列列（细胞类型）
+heat_matrix <- heat_matrix[, intersect(ct_order, colnames(heat_matrix)), drop = FALSE]
+
 # 获取基因分类顺序（按分类排序）
 gene_order <- gene_to_category[["Gene"]][gene_to_category[["Gene"]] %in% rownames(heat_matrix)]
 # 添加不在分类列表中的基因
@@ -474,11 +487,7 @@ cat("  已保存:", fig2_pdf, "\n")
 # =============================================================================
 cat("\n>>> 绘制 Fig3: Nature标准分面气泡图 (31个铜死亡基因)...\n")
 
-# ---- 3a. 定义细胞类型和基因排序 ----
-# 细胞类型顺序: Neuro → Immune → Vascular → Ependymal
-ct_order <- c("Neuron", "OPC", "Oligodendrocyte", "Astrocyte",
-              "Microglia", "Pericyte", "Endothelial", "Ependymal", "Unknown")
-
+# ---- 3a. 定义基因排序 ----
 # 基因功能分类顺序 (保持与 gene_categories_en 一致)
 # 从 gene_categories_en 构建有序基因列表
 all_genes_ordered <- unlist(gene_categories_en, use.names = FALSE)
@@ -516,7 +525,8 @@ dot_long <- bind_rows(
     condition = factor(condition, levels = c("Sham", "MCAO")),
     cell_type = factor(cell_type, levels = ct_order),
     gene = factor(gene, levels = rev(all_genes_ordered))
-  )
+  ) %>%
+  filter(cell_type != "Unknown")
 
 stopifnot(nrow(dot_long) > 0)
 
@@ -556,8 +566,7 @@ ct_colors_dot <- c(
   "Microglia" = "#FF7F00",
   "Pericyte" = "#FFFF33",
   "Endothelial" = "#A65628",
-  "Ependymal" = "#F781BF",
-  "Unknown" = "#999999"
+  "Ependymal" = "#F781BF"
 )
 
 # Nature紫色渐变 (50级)
