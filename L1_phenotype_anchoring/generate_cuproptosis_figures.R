@@ -552,18 +552,42 @@ sig_labels <- dot_long %>%
     label_y = as.numeric(gene)
   )
 
-# ---- 3f. 绘制主气泡图 ----
+# ---- 3f. 计算 Nature 风格 scale 值 ----
+# 按基因z-score缩放: 展示相对表达水平
+dot_long <- dot_long %>%
+  group_by(gene) %>%
+  mutate(
+    avg.exp.scaled = (expr - mean(expr, na.rm = TRUE)) / sd(expr, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# ---- 3g. 定义细胞类型颜色映射 (用于顶部注释) ----
+ct_colors_dot <- c(
+  "Neuron" = "#E41A1C", "OPC" = "#377EB8",
+  "Oligodendrocyte" = "#4DAF4A", "Astrocyte" = "#984EA3",
+  "Microglia" = "#FF7F00", "Pericyte" = "#FFFF33",
+  "Endothelial" = "#A65628", "Ependymal" = "#F781BF",
+  "Unknown" = "#999999"
+)
+
+# Nature风格的紫色渐变 (50级)
+nature_purple <- colorRampPalette(
+  c('#fcfbfd', '#efedf5', '#dadaeb', '#bcbddc',
+    '#9e9ac8', '#807dba', '#6a51a3', '#4a1486')
+)(50)
+
+# ---- 3h. 绘制主气泡图 ----
 p_main <- ggplot(dot_long, aes(x = cell_type, y = gene)) +
-  # 基础气泡层: 所有基因-细胞组合
+  # 基础气泡层
   geom_point(
-    aes(size = pct, fill = expr),
+    aes(size = pct, fill = avg.exp.scaled),
     shape = 21, color = "black", stroke = 0.3
   ) +
-  # 显著差异基因: 叠加粗边框层
+  # 显著差异基因: 粗边框
   geom_point(
     data = dot_long %>% filter(significant == TRUE),
     aes(size = pct),
-    shape = 21, color = "black", stroke = 1.2, fill = NA
+    shape = 21, color = "black", stroke = 1.4, fill = NA
   ) +
   # 分面: 左=Sham, 右=MCAO
   facet_grid(~ condition, scales = "free_x", space = "free_x") +
@@ -573,62 +597,144 @@ p_main <- ggplot(dot_long, aes(x = cell_type, y = gene)) +
     name = "% Expressing",
     breaks = c(10, 25, 50, 75)
   ) +
-  # 气泡颜色 (Nature风格蓝-白-红渐变)
-  scale_fill_gradient2(
-    low = "#2166AC", mid = "#F7F7F7", high = "#B2182B",
-    midpoint = 0.5,
-    name = "Avg Expression",
-    oob = scales::squish
+  # Nature紫色渐变 (使用 scaled expression)
+  scale_fill_gradientn(
+    colours = nature_purple,
+    limits = c(-1.5, 2.5),
+    oob = scales::squish,
+    name = "Scaled Expression\n(z-score)"
   ) +
   # 标签
   labs(
-    x = "Cell Type",
+    x = NULL,
     y = NULL,
-    title = "Cuproptosis Gene Expression Across Cell Types (GSE174574, 24h MCAO)",
-    subtitle = "Dot size = % expressing cells | Color = mean expression | Bold border = significant (|log2FC|>0.25, adj.p<0.05)"
+    title = "Cuproptosis Gene Expression Across Cell Types",
+    subtitle = "GSE174574 (24h MCAO vs Sham, mouse)"
   ) +
   # 主题
-  theme_academic(base_size = 11) +
+  theme_bw(base_size = 11) +
   theme(
-    # Y轴基因名称斜体
+    # 完全无网格
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    # Y轴基因名: bold + italic
     axis.text.y = element_text(
-      face = "italic", size = 9,
+      face = "bold.italic", size = 9, colour = "black",
       margin = margin(r = 5)
     ),
-    # X轴细胞类型45度倾斜
-    axis.text.x = element_text(
-      angle = 45, hjust = 1, size = 9
-    ),
-    # 分面标签
-    strip.background = element_rect(fill = "grey92", color = "black", linewidth = 0.5),
-    strip.text = element_text(size = 11, face = "bold"),
+    # 去掉X轴标签 (改用顶部彩色圆点)
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    axis.line.y = element_line(colour = "black", linewidth = 0.4),
+    axis.ticks.y = element_line(colour = "black", linewidth = 0.4),
+    axis.ticks.length.y = unit(0.15, "cm"),
+    # 分面标签 - 优雅风格
+    strip.background = element_rect(fill = "grey95", color = "black", linewidth = 0.4),
+    strip.text = element_text(size = 12, face = "bold", colour = "black"),
     # 图例
     legend.position = "bottom",
     legend.box = "vertical",
     legend.key.width = unit(0.8, "cm"),
     legend.key.height = unit(0.3, "cm"),
-    legend.spacing = unit(0.2, "cm"),
-    # 间距
-    plot.margin = margin(0.5, 0.5, 0.5, 0.2, "cm"),
-    panel.spacing = unit(0.8, "lines"),
+    legend.spacing = unit(0.15, "cm"),
+    legend.text = element_text(size = 9, colour = "black"),
+    legend.title = element_text(size = 10, face = "bold", colour = "black"),
+    # 间距 - 为顶部注释留空间
+    plot.margin = margin(0.8, 0.5, 0.5, 0.2, "cm"),
+    panel.spacing = unit(0.6, "lines"),
     # 标题
-    plot.title = element_text(size = 12, face = "bold", hjust = 0.5, margin = margin(b = 5)),
-    plot.subtitle = element_text(size = 8, hjust = 0.5, colour = "gray40", margin = margin(b = 8))
+    plot.title = element_text(size = 13, face = "bold", hjust = 0.5, margin = margin(b = 4)),
+    plot.subtitle = element_text(size = 9, hjust = 0.5, colour = "gray40", margin = margin(b = 2))
+  ) +
+  # 允许绘图区外绘制 (用于顶部注释)
+  coord_cartesian(clip = "off")
+
+# ---- 3i. 生成左侧基因分类色条 (segments风格) ----
+# 计算每个分类在 y 轴上的起止位置
+gene_positions <- gene_anno %>%
+  mutate(y_pos = seq_len(n()))  # 从下到上 1:31
+
+category_segments <- gene_positions %>%
+  group_by(Category) %>%
+  summarise(
+    ymin = min(y_pos),
+    ymax = max(y_pos),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    x = 0,
+    Category = factor(as.character(Category), levels = names(category_colors))
   )
 
-# ---- 3g. 组合左侧色条 + 主气泡图 ----
-p3 <- p_anno + p_main +
-  plot_layout(widths = c(0.025, 1), guides = "collect") &
+p_anno_seg <- ggplot(gene_positions, aes(y = y_pos)) +
+  geom_segment(
+    data = category_segments,
+    aes(
+      x = x, xend = x + 1,
+      y = ymin - 0.5, yend = ymax + 0.5,
+      color = Category
+    ),
+    linewidth = 5, alpha = 0.85
+  ) +
+  scale_color_manual(
+    values = category_colors,
+    name = "Gene Category"
+  ) +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(
+    limits = c(0.5, nrow(gene_positions) + 0.5),
+    expand = c(0, 0)
+  ) +
+  theme_void() +
+  theme(
+    plot.margin = margin(0, -2, 0, 0),
+    legend.position = "none"
+  )
+
+# ---- 3j. 组合左侧色条 + 主气泡图 ----
+p3 <- p_anno_seg + p_main +
+  plot_layout(widths = c(0.03, 1), guides = "collect") &
   theme(legend.position = "bottom")
 
-# ---- 3h. 保存 ----
+# ---- 3k. 组合: 左侧色条 + 主气泡 + 顶部细胞类型注释 ----
+# 使用 patchwork 叠加: 先用 p3, 再在顶部绘制细胞类型标签
+# 增加细胞类型颜色图例 (独立图例)
+ct_legend_data <- data.frame(
+  cell_type = names(ct_colors_dot),
+  color = ct_colors_dot,
+  x = 1:9, y = 1,
+  stringsAsFactors = FALSE
+)
+ct_legend <- ct_legend_data %>%
+  mutate(cell_type = factor(cell_type, levels = ct_order)) %>%
+  ggplot(aes(x = cell_type, y = 1, color = cell_type)) +
+  geom_point(size = 3.5) +
+  scale_color_manual(
+    values = ct_colors_dot,
+    name = "Cell Type"
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 8, face = "italic"),
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.spacing.y = unit(0.1, "cm")
+  )
+
+# 最终的 Fig3: 左侧分类色条 + 主气泡图 (包含顶部分面标签说明细胞类型)
+p3_final <- p_anno_seg + p_main +
+  plot_layout(widths = c(0.025, 1))
+
+# ---- 3l. 保存 ----
 fig3_file <- file.path(output_dir, "Fig3_celltype_dotplot.png")
-ggsave(fig3_file, p3, width = 14, height = 10, dpi = 600)
+ggsave(fig3_file, p3_final, width = 14, height = 10, dpi = 600)
 cat("  已保存:", fig3_file, "\n")
 
 # PDF版
 fig3_pdf <- file.path(output_dir, "Fig3_celltype_dotplot.pdf")
-ggsave(fig3_pdf, p3, width = 14, height = 10, dpi = 300, device = cairo_pdf)
+ggsave(fig3_pdf, p3_final, width = 14, height = 10, dpi = 300, device = cairo_pdf)
 cat("  已保存:", fig3_pdf, "\n")
 
 # =============================================================================
