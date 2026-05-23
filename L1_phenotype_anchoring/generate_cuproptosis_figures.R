@@ -24,7 +24,8 @@ install_if_missing <- function(pkgs) {
 }
 
 pkgs <- c("ggplot2", "ggrepel", "dplyr", "tidyr", "pheatmap",
-          "RColorBrewer", "scales", "grid", "gridExtra", "viridis")
+          "RColorBrewer", "scales", "grid", "gridExtra", "viridis",
+          "patchwork")
 install_if_missing(pkgs)
 
 # =============================================================================
@@ -459,203 +460,175 @@ dev.off()
 cat("  已保存:", fig2_pdf, "\n")
 
 # =============================================================================
-# Fig 3: 各亚群差异小提琴图 (关键铜死亡基因)
-#   修复要点:
-#     1. 基因选择: mean(|log2FC|) * n_sig_celltypes 综合评分排序
-#     2. 效应大小标注: 仅当 |log2FC| > 0.25 且 p < 0.05 才显示显著性星号
-#     3. 可视化: 小提琴 + 箱线图 + 均值点 + 95%CI 误差线 (无散点, 更干净)
-#     4. 不显著的组合不做任何标注
+# Fig 3: Nature标准分面气泡图 (Dot Plot) - 所有31个铜死亡基因
+#   设计规范:
+#     1. X轴: 细胞类型 (9种, Neuro→Immune→Vascular→Ependymal)
+#     2. Y轴: 31个铜死亡基因 (按功能分类分组, 左侧色条标注)
+#     3. 点大小: 表达该基因的细胞比例 (% expressing)
+#     4. 点颜色: 平均表达水平 (log-normalized average expression)
+#     5. 分面: 左=Sham, 右=MCAO
+#     6. 显著差异(|log2FC|>0.25 & p_adjust<0.05): 黑色粗边框
 # =============================================================================
-cat("\n>>> 绘制 Fig3: 关键基因小提琴图 (效应大小过滤版)...\n")
+cat("\n>>> 绘制 Fig3: Nature标准分面气泡图 (31个铜死亡基因)...\n")
 
-# ---- 4a. 综合评分选择前8个基因 ----
-# 评分公式: mean(|log2FC|) * n_sig_celltypes
-#   - mean(|log2FC|): 跨细胞类型平均绝对效应大小
-#   - n_sig_celltypes: |log2FC|>0.25 且 p_adjust<0.05 的细胞类型数
-gene_composite <- ct_deg %>%
-  group_by(gene) %>%
-  summarise(
-    mean_abs_lfc = mean(abs(log2FC), na.rm = TRUE),
-    n_sig = sum(abs(log2FC) > 0.25 & p_adjust < 0.05, na.rm = TRUE),
-    composite_score = mean_abs_lfc * n_sig,
-    .groups = "drop"
-  ) %>%
-  arrange(desc(composite_score))
+# ---- 3a. 定义细胞类型和基因排序 ----
+# 细胞类型顺序: Neuro → Immune → Vascular → Ependymal
+ct_order <- c("Neuron", "OPC", "Oligodendrocyte", "Astrocyte",
+              "Microglia", "Pericyte", "Endothelial", "Ependymal", "Unknown")
 
-cat("  基因综合评分排名:\n")
-print(gene_composite, n = 15)
+# 基因功能分类顺序 (保持与 gene_categories_en 一致)
+# 从 gene_categories_en 构建有序基因列表
+all_genes_ordered <- unlist(gene_categories_en, use.names = FALSE)
+# 只保留数据中存在的基因
+genes_in_data <- unique(ct_deg[["gene"]])
+all_genes_ordered <- all_genes_ordered[all_genes_ordered %in% genes_in_data]
+stopifnot("Data does not contain all 31 cuproptosis genes" =
+  length(all_genes_ordered) == 31)
 
-top_n_genes <- 8
-if (nrow(gene_composite) < top_n_genes) {
-  top_n_genes <- nrow(gene_composite)
-}
-top_genes <- gene_composite[["gene"]][seq_len(top_n_genes)]
-cat("  选择前", top_n_genes, "个基因:", paste(top_genes, collapse = ", "), "\n")
-
-# ---- 4b. 过滤小提琴数据 ----
-vio_sub <- vio_data[vio_data[["gene"]] %in% top_genes, ]
-stopifnot("vio_sub is empty after gene filtering" = nrow(vio_sub) > 0)
-cat("  小提琴数据行数:", nrow(vio_sub), "\n")
-
-# 确保condition为因子
-vio_sub[["condition"]] <- factor(vio_sub[["condition"]], levels = c("Sham", "MCAO"))
-
-# 设置基因因子顺序
-vio_sub[["gene"]] <- factor(vio_sub[["gene"]], levels = top_genes)
-
-# ---- 4c. 效应大小过滤的统计标注 ----
-# 步骤1: 计算每个基因-细胞类型-条件的均值(用于log2FC)和进行Wilcoxon检验
-# 注意: expression已经是log1p标准化, 因此 MCAO_mean - Sham_mean ≈ log2FC
-stat_raw <- vio_sub %>%
-  group_by(gene, cell_type, condition) %>%
-  summarise(
-    mean_expr = mean(expression, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-# 转换为宽格式计算效应大小
-stat_effects <- stat_raw %>%
-  pivot_wider(names_from = condition, values_from = mean_expr) %>%
-  mutate(effect_log2FC = MCAO - Sham)  # log1p空间差值 ≈ log2FC
-
-# 步骤2: Wilcoxon检验
-stat_pvals <- vio_sub %>%
-  group_by(gene, cell_type) %>%
-  summarise(
-    p_val = tryCatch({
-      # 提取当前分组数据
-      sub_data <- vio_sub[vio_sub[["gene"]] == unique(gene) &
-                          vio_sub[["cell_type"]] == unique(cell_type), ]
-      test <- wilcox.test(expression ~ condition, data = sub_data)
-      test[["p.value"]]
-    }, error = function(e) NA_real_),
-    .groups = "drop"
-  )
-
-# 步骤3: 合并效应大小和p值, 应用效应大小过滤
-#   - 仅当 |log2FC| > 0.25 且 p < 0.05 才标注
-#   - 不标注 "ns"
-stat_results <- stat_effects %>%
-  left_join(stat_pvals, by = c("gene", "cell_type")) %>%
+# ---- 3b. 准备长格式气泡图数据 ----
+# 将数据从宽格式转换为长格式: 为Sham和MCAO各生成一行
+dot_data <- ct_deg %>%
   mutate(
-    # 效应大小过滤核心逻辑
-    show_star = abs(effect_log2FC) > 0.25 & !is.na(p_val) & p_val < 0.05,
-    p_label = case_when(
-      !show_star                      ~ "",     # 不显著或效应太小 → 不标注
-      p_val < 0.001                   ~ "***",
-      p_val < 0.01                    ~ "**",
-      p_val < 0.05                    ~ "*",
-      TRUE                            ~ ""      # 不显示"ns"
+    significant = abs(log2FC) > 0.25 & p_adjust < 0.05,
+    # 在原始数据上标注分类
+    Category = gene_to_category[["Category"]][match(gene, gene_to_category[["Gene"]])]
+  )
+
+# 转换为长格式: 每个基因-细胞类型-条件组合一行
+dot_long <- bind_rows(
+  dot_data %>%
+    mutate(
+      condition = "Sham",
+      pct = pct_sham,
+      expr = sham_mean
     ),
-    p_y = NA_real_
+  dot_data %>%
+    mutate(
+      condition = "MCAO",
+      pct = pct_mcao,
+      expr = mcao_mean
+    )
+) %>%
+  mutate(
+    condition = factor(condition, levels = c("Sham", "MCAO")),
+    cell_type = factor(cell_type, levels = ct_order),
+    gene = factor(gene, levels = rev(all_genes_ordered))
   )
 
-# 步骤4: 基于95%CI上界计算标注y位置
-ci_upper_data <- vio_sub %>%
-  group_by(gene, cell_type, condition) %>%
-  summarise(
-    n = n(),
-    mean_expr = mean(expression, na.rm = TRUE),
-    sd_expr = sd(expression, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
+stopifnot(nrow(dot_long) > 0)
+
+cat("  长格式数据行数:", nrow(dot_long), "\n")
+cat("  细胞类型:", paste(levels(dot_long[["cell_type"]]), collapse = ", "), "\n")
+cat("  基因数:", nlevels(dot_long[["gene"]]), "\n")
+
+# ---- 3c. 构建基因分类注释数据框 (用于左侧色条) ----
+gene_anno <- gene_to_category %>%
+  filter(Gene %in% genes_in_data) %>%
   mutate(
-    se = sd_expr / sqrt(n),
-    ci_upper = mean_expr + 1.96 * se
+    Gene = factor(Gene, levels = rev(all_genes_ordered)),
+    Category = factor(Category, levels = names(category_colors))
   ) %>%
-  group_by(gene, cell_type) %>%
-  summarise(max_ci_upper = max(ci_upper, na.rm = TRUE), .groups = "drop")
+  arrange(Gene)
 
-stat_results <- stat_results %>%
-  left_join(ci_upper_data, by = c("gene", "cell_type")) %>%
-  mutate(p_y = max_ci_upper * 1.15 + 0.05)
-
-# 统计标注数量
-n_annotations <- sum(stat_results[["show_star"]], na.rm = TRUE)
-cat("  效应大小过滤后标注数:", n_annotations, "/", nrow(stat_results), "\n")
-
-# ---- 4d. 细胞类型排序 ----
-# 按第一个基因的Sham组表达均值排序
-first_gene <- top_genes[1]
-ct_order <- vio_sub %>%
-  filter(gene == first_gene, condition == "Sham") %>%
-  group_by(cell_type) %>%
-  summarise(mean_expr = mean(expression, na.rm = TRUE), .groups = "drop") %>%
-  arrange(desc(mean_expr))
-vio_sub[["cell_type"]] <- factor(vio_sub[["cell_type"]],
-  levels = ct_order[["cell_type"]])
-
-# ---- 4e. 计算均值和95%CI数据(用于绘图) ----
-mean_ci <- vio_sub %>%
-  group_by(gene, cell_type, condition) %>%
-  summarise(
-    mean_expr = mean(expression, na.rm = TRUE),
-    sd_expr = sd(expression, na.rm = TRUE),
-    n = n(),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    se = sd_expr / sqrt(n),
-    ci_lower = mean_expr - 1.96 * se,
-    ci_upper = mean_expr + 1.96 * se
-  )
-
-# ---- 4f. 自定义配色 ----
-condition_colors <- c("Sham" = "#4DAF4A", "MCAO" = "#E41A1C")
-
-# ---- 4g. 绘制 ----
-p3 <- ggplot(vio_sub, aes(x = cell_type, y = expression, fill = condition)) +
-  # 小提琴 (半透明, 黑色描边)
-  geom_violin(trim = TRUE, scale = "width", alpha = 0.55,
-    position = position_dodge(width = 0.8), color = "black", linewidth = 0.3) +
-  # 箱线图内嵌 (窄宽度, 不显示异常值)
-  geom_boxplot(width = 0.12, position = position_dodge(width = 0.8),
-    alpha = 0.85, outlier.shape = NA, color = "black", linewidth = 0.3) +
-  # 均值点 + 95%CI 误差线 (干净的专业展示, 无散点)
-  geom_pointrange(
-    data = mean_ci,
-    aes(x = cell_type, y = mean_expr,
-        ymin = ci_lower, ymax = ci_upper,
-        group = condition),
-    position = position_dodge(width = 0.8),
-    size = 0.6, linewidth = 0.5, color = "black"
+# ---- 3d. 创建左侧基因分类色条 ----
+p_anno <- ggplot(gene_anno, aes(x = 1, y = Gene, fill = Category)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_manual(
+    values = category_colors,
+    name = "Gene Category"
   ) +
-  # 分面 (自由Y轴刻度, 每个基因独立)
-  facet_wrap(~ gene, nrow = 2, scales = "free_y") +
-  # 颜色
-  scale_fill_manual(values = condition_colors, name = "Condition") +
-  # 效应大小过滤后的统计标注 (只显示有意义的星号)
-  geom_text(
-    data = stat_results[stat_results[["show_star"]] == TRUE, ],
-    aes(x = cell_type, y = p_y, label = p_label),
-    inherit.aes = FALSE,
-    size = 3.5, vjust = 0.5, color = "black", fontface = "bold"
+  theme_void() +
+  theme(
+    plot.margin = margin(0, 0, 0, 0),
+    legend.position = "none"
+  )
+
+# ---- 3e. 创建显著基因标注数据 ----
+sig_labels <- dot_long %>%
+  filter(significant == TRUE) %>%
+  mutate(
+    # 在气泡中心添加星号位置
+    label_x = as.numeric(cell_type),
+    label_y = as.numeric(gene)
+  )
+
+# ---- 3f. 绘制主气泡图 ----
+p_main <- ggplot(dot_long, aes(x = cell_type, y = gene)) +
+  # 基础气泡层: 所有基因-细胞组合
+  geom_point(
+    aes(size = pct, fill = expr),
+    shape = 21, color = "black", stroke = 0.3
+  ) +
+  # 显著差异基因: 叠加粗边框层
+  geom_point(
+    data = dot_long %>% filter(significant == TRUE),
+    aes(size = pct),
+    shape = 21, color = "black", stroke = 1.2, fill = NA
+  ) +
+  # 分面: 左=Sham, 右=MCAO
+  facet_grid(~ condition, scales = "free_x", space = "free_x") +
+  # 气泡大小
+  scale_size_continuous(
+    range = c(0.5, 7),
+    name = "% Expressing",
+    breaks = c(10, 25, 50, 75)
+  ) +
+  # 气泡颜色 (Nature风格蓝-白-红渐变)
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "#F7F7F7", high = "#B2182B",
+    midpoint = 0.5,
+    name = "Avg Expression",
+    oob = scales::squish
   ) +
   # 标签
   labs(
     x = "Cell Type",
-    y = "Normalized Expression (log1p)",
-    title = "Cuproptosis Gene Expression Across Cell Types (GSE174574, 24h MCAO)"
+    y = NULL,
+    title = "Cuproptosis Gene Expression Across Cell Types (GSE174574, 24h MCAO)",
+    subtitle = "Dot size = % expressing cells | Color = mean expression | Bold border = significant (|log2FC|>0.25, adj.p<0.05)"
   ) +
   # 主题
-  theme_academic(base_size = 10) +
+  theme_academic(base_size = 11) +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-    strip.background = element_rect(fill = "grey95", color = "black"),
-    strip.text = element_text(size = 9, face = "bold.italic"),
-    legend.position = "top",
-    plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
-    panel.spacing = unit(0.8, "lines")
+    # Y轴基因名称斜体
+    axis.text.y = element_text(
+      face = "italic", size = 9,
+      margin = margin(r = 5)
+    ),
+    # X轴细胞类型45度倾斜
+    axis.text.x = element_text(
+      angle = 45, hjust = 1, size = 9
+    ),
+    # 分面标签
+    strip.background = element_rect(fill = "grey92", color = "black", linewidth = 0.5),
+    strip.text = element_text(size = 11, face = "bold"),
+    # 图例
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.key.width = unit(0.8, "cm"),
+    legend.key.height = unit(0.3, "cm"),
+    legend.spacing = unit(0.2, "cm"),
+    # 间距
+    plot.margin = margin(0.5, 0.5, 0.5, 0.2, "cm"),
+    panel.spacing = unit(0.8, "lines"),
+    # 标题
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 8, hjust = 0.5, colour = "gray40", margin = margin(b = 8))
   )
 
-# 保存
-fig3_file <- file.path(output_dir, "Fig3_celltype_violin.png")
-ggsave(fig3_file, p3, width = 14, height = 12, dpi = 600)
+# ---- 3g. 组合左侧色条 + 主气泡图 ----
+p3 <- p_anno + p_main +
+  plot_layout(widths = c(0.025, 1), guides = "collect") &
+  theme(legend.position = "bottom")
+
+# ---- 3h. 保存 ----
+fig3_file <- file.path(output_dir, "Fig3_celltype_dotplot.png")
+ggsave(fig3_file, p3, width = 14, height = 10, dpi = 600)
 cat("  已保存:", fig3_file, "\n")
 
 # PDF版
-fig3_pdf <- file.path(output_dir, "Fig3_celltype_violin.pdf")
-ggsave(fig3_pdf, p3, width = 14, height = 12, dpi = 300, device = cairo_pdf)
+fig3_pdf <- file.path(output_dir, "Fig3_celltype_dotplot.pdf")
+ggsave(fig3_pdf, p3, width = 14, height = 10, dpi = 300, device = cairo_pdf)
 cat("  已保存:", fig3_pdf, "\n")
 
 # =============================================================================
@@ -667,5 +640,5 @@ cat("输出目录:", output_dir, "\n")
 cat("生成文件:\n")
 cat("  1. Fig1_bulk_volcano_GSE97537.png (14x7\", 600dpi) - 宽扁火山图\n")
 cat("  2. Fig2_celltype_cuproptosis_heatmap.png (12x", round(fig_height, 1), "\", 600dpi)\n", sep = "")
-cat("  3. Fig3_celltype_violin.png (14x12\", 600dpi) - 效应大小过滤, 小提琴+箱线图+均值+95%CI\n")
+cat("  3. Fig3_celltype_dotplot.png (14x10\", 600dpi) - Nature标准分面气泡图, 31基因×9细胞类型×2条件\n")
 cat(paste(rep("=", 60), collapse = ""), "\n")
