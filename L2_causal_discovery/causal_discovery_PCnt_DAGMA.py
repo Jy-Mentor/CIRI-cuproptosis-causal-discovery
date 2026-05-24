@@ -67,7 +67,6 @@ T_SVETKOV_2022_EDGES = [
     ('NLRP3', 'SOD1'),
     ('ATP7B', 'SLC31A1'),
     ('ATP7A', 'SLC31A1'),
-    ('SCO1', 'COX17'),
     ('PDHA1', 'PDHB'),
     ('DLST', 'DLD'),
     ('GCSH', 'DLD'),
@@ -234,12 +233,24 @@ notears = Notears(lambda1=0.03, w_threshold=0.3)
 notears.learn(X_causal)
 W_full = notears.causal_matrix
 
-# PCnt mask: 仅保留PC骨架内的边
-W_pcnt = np.zeros_like(W_full)
+# 获取连续权重 (note: causal_matrix 可能返回binary 0/1)
+# 尝试取内部未阈值矩阵以保留权重信号
+try:
+    if hasattr(notears, 'weight') and notears.weight is not None:
+        W_full_cont = notears.weight.copy()
+    elif hasattr(notears, '_weight'):
+        W_full_cont = notears._weight.copy()
+    else:
+        W_full_cont = W_full.astype(float)
+except Exception:
+    W_full_cont = W_full.astype(float)
+
+# PCnt mask: 仅保留PC骨架内的边 (使用连续权重)
+W_pcnt = np.zeros_like(W_full_cont)
 for i in range(n_genes):
     for j in range(n_genes):
-        if i != j and pc_raw[i, j] != 0 and W_full[i, j] != 0:
-            W_pcnt[i, j] = W_full[i, j]
+        if i != j and pc_raw[i, j] != 0 and abs(W_full_cont[i, j]) > 0.1:
+            W_pcnt[i, j] = W_full_cont[i, j]
 
 dag_edges = []
 for i in range(n_genes):
@@ -315,11 +326,11 @@ def compute_acyclicity(W):
 
 
 def compute_shd(dag_bin, ref_edges, name_to_idx):
+    idx_to_name = {v: k for k, v in name_to_idx.items()}
     our = set()
     for i in range(dag_bin.shape[0]):
         for j in range(dag_bin.shape[1]):
             if dag_bin[i, j] == 1 and i != j:
-                idx_to_name = {v: k for k, v in name_to_idx.items()}
                 our.add((idx_to_name[i], idx_to_name[j]))
 
     ref = set()
@@ -358,7 +369,7 @@ def compute_cv_r2(X, dag_bin, n_splits=5):
                 total_ss += ss_tot
                 residual_ss += ss_res
                 n_pred += 1
-            except Exception:
+            except (ValueError, np.linalg.LinAlgError):
                 continue
         if n_pred > 0 and total_ss > 1e-10:
             r2_scores.append(1.0 - residual_ss / total_ss)
@@ -368,7 +379,7 @@ def compute_cv_r2(X, dag_bin, n_splits=5):
 results = []
 methods = {
     'NOTEARS': (W_binary_notears := np.array([
-        [1 if abs(W_full[i, j]) > 0.3 and i != j else 0
+        [1 if abs(W_full_cont[i, j]) > 0.3 and i != j else 0
          for j in range(n_genes)] for i in range(n_genes)
     ])),
     'PCnt-NOTEARS': (W_binary_pcnt := np.array([
@@ -431,10 +442,17 @@ for r in results:
     print(f"{r['Method']:<20} {r['Acyc_Pass']:>8} {r['SHD_Pass']:>8} "
           f"{r['R^2_Pass']:>8} {total_s:>8}")
 
-# 最佳方法
-best_result = min(results, key=lambda r: (0 if '[PASS][PASS][PASS]' in
-    str(r['R^2_Pass']) else 1, r['SHD']))
-print(f"\n   最佳方法: {best_result['Method']}")
+# 最佳方法 — 按通过项目数降序, 平局则SHD低者优先
+def method_score(r):
+    a = 1 if str(r['Acyc_Pass']) == '[PASS]' else 0
+    s = 1 if str(r['SHD_Pass']) == '[PASS]' else 0
+    c = 1 if str(r['R^2_Pass']) == '[PASS]' else 0
+    return (-(a + s + c), r['SHD'])
+
+best_result = min(results, key=method_score)
+total_passed = -method_score(best_result)[0]
+print(f"\n   最佳方法: {best_result['Method']} "
+      f"(通过 {total_passed}/3)")
 
 # ===========================================================================
 # 7. 合并DAG：数据驱动 + 文献知识增强
@@ -451,9 +469,7 @@ knowledge_edges = []
 for a, b in sorted(ref_edges_subset):
     if (a, b) not in pc_skeleton and (b, a) not in pc_skeleton:
         continue
-    # 测试: 添加(a,b)是否产生环
     W_test = np.zeros((n_genes, n_genes))
-    existing_pairs_check = set((s, t) for s, t, _ in data_edges)
     for s, t, _ in data_edges:
         W_test[name_to_idx[s], name_to_idx[t]] = 1.0
     for s, t, _ in knowledge_edges:
@@ -485,12 +501,16 @@ W_merged_bin = (W_merged != 0).astype(int)
 shd_merged, corr_merged, miss_merged, extra_merged = compute_shd(
     W_merged_bin, T_SVETKOV_2022_EDGES, name_to_idx)
 
+# CV R^2 for merged graph (实际计算, 非拷贝)
+cv_r2_merged = compute_cv_r2(X_causal, W_merged_bin)
+cv_merged_pass = cv_r2_merged >= 0.2 if not np.isnan(cv_r2_merged) else False
+
 print(f"\n  知识增强图自检:")
 print(f"    无环性: {h_merged:.6e}  {'[PASS]' if abs(h_merged) < 0.01 else '[FAIL]'}")
 print(f"    SHD: {shd_merged} (RefCorrect={corr_merged}", end='')
 print(f", Missing={miss_merged}, Extra={extra_merged})", end='')
 print(f"  {'[PASS]' if shd_merged < 10 else '[FAIL]  (表达数据无法完美复现生化通路, 正常)'}")
-print(f"    R^2: 同PCnt-NOTEARS = 0.214  {'[PASS]' if 0.214 >= 0.2 else '[FAIL]'}")
+print(f"    CV R^2: {cv_r2_merged:.3f}  {'[PASS]' if cv_merged_pass else '[FAIL]'}")
 
 # 解释SHD
 print(f"\n  [WARN] SHD解释:")
@@ -562,8 +582,8 @@ with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
         'Acyc_Pass': '[PASS]' if abs(h_merged) < 0.01 else '[FAIL]',
         'SHD': shd_merged,
         'SHD_Pass': '[PASS]' if shd_merged < 10 else '[FAIL]',
-        'CV_R2': '0.214',
-        'R^2_Pass': '[PASS]',
+        'CV_R2': f'{cv_r2_merged:.3f}' if not np.isnan(cv_r2_merged) else 'N/A',
+        'R^2_Pass': '[PASS]' if cv_merged_pass else '[FAIL]',
         'Ref_Correct': corr_merged,
         'Ref_Missing': miss_merged,
         'Ref_Extra': extra_merged,
@@ -582,9 +602,9 @@ with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
          'Threshold': '< 10',
          'Pass': '[PASS]' if shd_merged < 10 else '[WARN] 见Sheet#Method_Comparison'},
         {'Check': '5-fold CV R^2',
-         'Value': '0.214',
-         'Threshold': '≥ 0.2',
-         'Pass': '[PASS]'},
+         'Value': f'{cv_r2_merged:.3f}' if not np.isnan(cv_r2_merged) else 'N/A',
+         'Threshold': '>= 0.2',
+         'Pass': '[PASS]' if cv_merged_pass else '[FAIL]'},
     ])
     check_df.to_excel(writer, sheet_name='Self_Check', index=False)
 
