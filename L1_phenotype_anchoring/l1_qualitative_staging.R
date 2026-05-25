@@ -26,6 +26,7 @@ suppressPackageStartupMessages({
   library(edgeR)
   library(sva)
   library(biomaRt)
+  library(mgcv)
   library(ggplot2)
   library(ggpubr)
   library(pheatmap)
@@ -219,6 +220,8 @@ map_and_clean_probes <- function(expr_mat, probe2gene_map) {
   gene_names <- probe2gene_map[common]
   # 去除 Affymetrix 多基因映射的 /// 后缀
   gene_names <- gsub(" /// .*$", "", gene_names)
+  # 统一转为首字母大写格式（GPL1355注释多为全大写，需与MODULE_GENES_RAT匹配）
+  gene_names <- str_to_title(gene_names)
   # 按基因名聚合（均值）
   expr_agg <- aggregate(as.data.frame(expr_mat), by = list(gene = gene_names), FUN = mean, na.rm = TRUE)
   rownames(expr_agg) <- expr_agg$gene
@@ -236,12 +239,22 @@ gsm_ids_97537 <- gsub('"', '', gsm_raw[-1])  # 去掉第一列（!Sample_geo_acc
 gsm_ids_97537 <- gsm_ids_97537[grepl("^GSM", gsm_ids_97537)]
 cat(sprintf("  识别到 %d 个 GSM 样本\n", length(gsm_ids_97537)))
 
-# GSE97537: MCAO n=7, Sham n=5 (已知设计)
-gse97537_group <- c(rep("MCAO_24h", 7), rep("Sham_24h", 5))
+# 从系列矩阵解析 Sample_title 自动分配分组（避免硬编码顺序错配）
+title_line_97537 <- series_lines[grepl("^!Sample_title", series_lines)]
+title_parts_97537 <- strsplit(title_line_97537, "\t")[[1]]
+titles_97537 <- gsub('"', '', title_parts_97537[-1])
+titles_97537 <- titles_97537[titles_97537 != ""]
+
+gse97537_group <- ifelse(grepl("MCAO", titles_97537, ignore.case = TRUE), "MCAO_24h",
+                  ifelse(grepl("Sham", titles_97537, ignore.case = TRUE), "Sham_24h", "Unknown"))
+# 按 GSM ID 对齐（确保表达矩阵列与分组一一对应）
 gsm_order <- gsm_ids_97537[seq_len(min(length(gsm_ids_97537), length(gse97537_group)))]
 gse97537_group <- gse97537_group[seq_len(length(gsm_order))]
 names(gse97537_group) <- gsm_order
-cat(sprintf("  MCAO: %d, Sham: %d\n", sum(grepl("MCAO", gse97537_group)), sum(grepl("Sham", gse97537_group))))
+cat(sprintf("  MCAO: %d, Sham: %d, Unknown: %d\n",
+            sum(grepl("MCAO", gse97537_group)),
+            sum(grepl("Sham", gse97537_group)),
+            sum(grepl("Unknown", gse97537_group))))
 
 # -------------------- 1C. 加载 GSE61616（大鼠芯片, 7d） --------------------
 cat("\n--- 1C. 加载 GSE61616 (大鼠 Affymetrix, 7d) ---\n")
@@ -280,14 +293,31 @@ probe2gene_61616 <- probe2gene_61616[!is.na(probe2gene_61616) & probe2gene_61616
 
 gse61616_expr <- map_and_clean_probes(gse61616_expr, probe2gene_61616)
 
-# GSE61616: Sham n=5, Model n=5, XST n=5
-sample_lines_61616 <- series_lines_61616[grepl("!Sample_title", series_lines_61616)]
-gse61616_group <- c(rep("Sham_7d", 5), rep("Model_7d", 5), rep("XST_7d", 5))
-names(gse61616_group) <- colnames(gse61616_expr)
-cat(sprintf("  Sham: %d, Model: %d, XST: %d\n",
+# 从系列矩阵解析 Sample_title 自动分配分组
+title_line_61616 <- series_lines_61616[grepl("^!Sample_title", series_lines_61616)]
+title_parts_61616 <- strsplit(title_line_61616, "\t")[[1]]
+titles_61616 <- gsub('"', '', title_parts_61616[-1])
+titles_61616 <- titles_61616[titles_61616 != ""]
+
+gse61616_group <- ifelse(grepl("Sham", titles_61616, ignore.case = TRUE), "Sham_7d",
+                  ifelse(grepl("Model|MCAO", titles_61616, ignore.case = TRUE), "Model_7d",
+                  ifelse(grepl("XST", titles_61616, ignore.case = TRUE), "XST_7d", "Unknown")))
+
+# 解析 GSM ID 并对齐
+gsm_line_61616 <- series_lines_61616[grepl("^!Sample_geo_accession", series_lines_61616)]
+gsm_parts_61616 <- strsplit(gsm_line_61616, "\t")[[1]]
+gsm_ids_61616 <- gsub('"', '', gsm_parts_61616[-1])
+gsm_ids_61616 <- gsm_ids_61616[grepl("^GSM", gsm_ids_61616)]
+
+n_61616 <- min(length(gsm_ids_61616), length(gse61616_group))
+gse61616_group <- gse61616_group[1:n_61616]
+names(gse61616_group) <- gsm_ids_61616[1:n_61616]
+
+cat(sprintf("  Sham: %d, Model: %d, XST: %d, Unknown: %d\n",
             sum(grepl("Sham", gse61616_group)),
             sum(grepl("Model", gse61616_group)),
-            sum(grepl("XST", gse61616_group))))
+            sum(grepl("XST", gse61616_group)),
+            sum(grepl("Unknown", gse61616_group))))
 
 # -------------------- 1D. 各数据集独立 ssGSEA（避免跨物种基因映射问题）--------------------
 cat("\n--- 1D. 各数据集独立计算 ssGSEA ---\n")
@@ -382,6 +412,12 @@ common_mod_cols <- Reduce(intersect, lapply(all_ssgsea_parts, function(x) {
   setdiff(colnames(x), c("timepoint", "batch", "sample_id"))
 }))
 cat(sprintf("  跨数据集共同模块: %d\n", length(common_mod_cols)))
+
+if (length(common_mod_cols) < 3) {
+  stop(sprintf("跨数据集共同模块数不足 (%d < 3)。请检查基因符号大小写映射，GPL1355注释需转为首字母大写",
+               length(common_mod_cols)))
+}
+cat(sprintf("  共同模块: %s\n", paste(common_mod_cols, collapse = ", ")))
 
 ssgsea_list <- lapply(all_ssgsea_parts, function(x) x[, c(common_mod_cols, "timepoint", "batch", "sample_id"), drop = FALSE])
 ssgsea_df <- do.call(rbind, ssgsea_list)
@@ -634,6 +670,16 @@ run_monocle3 <- function() {
       library(SeuratWrappers)
     })
 
+    # Seurat v4/v5 兼容：选择正确的表达矩阵提取函数
+    seurat_v5 <- packageVersion("Seurat") >= "5.0.0"
+    get_counts <- if (seurat_v5) {
+      function(obj) LayerData(obj, assay = "RNA", layer = "counts")
+    } else {
+      function(obj) GetAssayData(obj, assay = "RNA", slot = "counts")
+    }
+    cat(sprintf("  Seurat 版本: %s, 使用 %s 提取counts\n",
+                packageVersion("Seurat"), ifelse(seurat_v5, "LayerData (v5)", "GetAssayData (v4)")))
+
     # 从10X数据构建Seurat对象
     data_10x_dir <- "D:/反向网络药理学/L1 数据集/RNA-seq/GSE174574_10X_organized"
     mcao_dirs <- list.files(data_10x_dir, pattern = "MCAO", full.names = TRUE)
@@ -718,7 +764,7 @@ run_monocle3 <- function() {
         # 使用 CytoTRACE 确定起点 (Seurat v5兼容)
         cyto_score <- tryCatch({
           suppressPackageStartupMessages(library(CytoTRACE))
-          expr_matrix <- LayerData(sub_seurat, assay = "RNA", layer = "counts")
+          expr_matrix <- get_counts(sub_seurat)
           cyto_res <- CytoTRACE(as.matrix(expr_matrix), ncores = 1)
           cyto_res$CytoTRACE
         }, error = function(e) {
@@ -727,8 +773,9 @@ run_monocle3 <- function() {
         })
 
         names(cyto_score) <- colnames(sub_seurat)
-        root_cells <- names(which.max(cyto_score))
-        cat(sprintf("    根节点: %d cells with max CytoTRACE\n", length(root_cells)))
+        max_val <- max(cyto_score, na.rm = TRUE)
+        root_cells <- names(cyto_score)[cyto_score == max_val & !is.na(cyto_score)]
+        cat(sprintf("    根节点: %d cells with max CytoTRACE = %.4f\n", length(root_cells), max_val))
 
         cds <- order_cells(cds, root_cells = root_cells)
 
@@ -759,7 +806,7 @@ run_monocle3 <- function() {
           stages = stage_labels,
           cyto_score = cyto_score,
           cell_type = ct,
-          expression_matrix = LayerData(sub_seurat, assay = "RNA", layer = "counts")
+          expression_matrix = get_counts(sub_seurat)
         )
 
         # 保存拟时序图
@@ -870,7 +917,8 @@ for (marker_name in names(ANCHOR_MARKERS)) {
   }
 
   # 单细胞 E/M/L 期平均表达（从 pseudotime 结果获取）
-  sc_stage_mean <- c(E = NA, M = NA, L = NA)
+  sc_stage_sum <- c(E = 0, M = 0, L = 0)
+  sc_stage_n   <- c(E = 0, M = 0, L = 0)
 
   ct_keys <- c("Microglia", "Neuron", "Astrocyte")
   if (!is.null(monocle_results)) {
@@ -892,8 +940,9 @@ for (marker_name in names(ANCHOR_MARKERS)) {
             if (length(common_cells) > 0) {
               stage_means <- tapply(as.numeric(gene_expr[common_cells]), res$stages[common_cells], mean)
               for (s in names(stage_means)) {
-                if (s %in% names(sc_stage_mean)) {
-                  sc_stage_mean[s] <- stage_means[s]
+                if (s %in% names(sc_stage_sum)) {
+                  sc_stage_sum[s] <- sc_stage_sum[s] + stage_means[s]
+                  sc_stage_n[s]   <- sc_stage_n[s] + 1
                 }
               }
             }
@@ -902,6 +951,8 @@ for (marker_name in names(ANCHOR_MARKERS)) {
       }
     }
   }
+  sc_stage_mean <- sc_stage_sum / sc_stage_n
+  sc_stage_mean[sc_stage_n == 0] <- NA
 
   sc_peak_stage <- names(which.max(sc_stage_mean))
   cat(sprintf("    scRNA 峰值阶段: %s (E=%.3f, M=%.3f, L=%.3f)\n",
@@ -952,8 +1003,10 @@ cat("\n--- 3B. CCA 辅助锚定 ---\n")
 
 if (!anchor_passed) {
   # 构建单细胞E/M/L × 6模块矩阵
-  sc_module_by_stage <- matrix(NA, nrow = 3, ncol = length(module_names),
-                                dimnames = list(c("E", "M", "L"), module_names))
+  sc_module_sum <- matrix(0, nrow = 3, ncol = length(module_names),
+                              dimnames = list(c("E", "M", "L"), module_names))
+  sc_module_n   <- matrix(0, nrow = 3, ncol = length(module_names),
+                              dimnames = list(c("E", "M", "L"), module_names))
 
   if (!is.null(monocle_results)) {
     for (ct in intersect(ct_keys, names(monocle_results))) {
@@ -973,8 +1026,9 @@ if (!anchor_passed) {
             if (length(common_cells) > 0) {
               stage_means <- tapply(mod_expr[common_cells], res$stages[common_cells], mean)
               for (s in names(stage_means)) {
-                if (s %in% rownames(sc_module_by_stage)) {
-                  sc_module_by_stage[s, mod] <- stage_means[s]
+                if (s %in% rownames(sc_module_sum)) {
+                  sc_module_sum[s, mod] <- sc_module_sum[s, mod] + stage_means[s]
+                  sc_module_n[s, mod]   <- sc_module_n[s, mod] + 1
                 }
               }
             }
@@ -983,6 +1037,8 @@ if (!anchor_passed) {
       }
     }
   }
+  sc_module_by_stage <- sc_module_sum / sc_module_n
+  sc_module_by_stage[sc_module_n == 0] <- NA
 
   # 构建Bulk时间点 × 6模块矩阵
   bulk_module_by_time <- matrix(NA, nrow = length(time_order), ncol = length(module_names),
@@ -1278,7 +1334,6 @@ if (all(is.na(anchor_mat)) || all(is.infinite(as.matrix(anchor_mat)))) {
 dev.off()
 
 # --- 6C. 标记基因趋势一致性条形图 ---
-pdf(file.path(FIGURE_DIR, "Fig_QualTCA_consistency_bar.pdf"), width = 8, height = 6)
 
 consistency_df <- data.frame(
   Category = c("一致", "不一致"),
@@ -1290,12 +1345,11 @@ ggplot(consistency_df, aes(x = Category, y = Count, fill = Category)) +
   geom_text(aes(label = Count), vjust = -0.5, size = 6) +
   scale_fill_manual(values = c("darkgreen", "gray60")) +
   labs(title = "标记基因跨组学趋势一致性",
-       subtitle = sprintf("阈值: ≥4/5 一致 (实际 %d/5)", n_consistent),
+       subtitle = sprintf("阈值: >=4/5 一致 (实际 %d/5)", n_consistent),
        y = "标记基因数") +
   theme_minimal(base_size = 14) +
   theme(legend.position = "none")
 ggsave(file.path(FIGURE_DIR, "Fig_QualTCA_consistency_bar.pdf"), width = 8, height = 6)
-dev.off()
 
 # ==================== 结果汇总保存 ====================
 cat("\n========== 结果汇总 ==========\n")
