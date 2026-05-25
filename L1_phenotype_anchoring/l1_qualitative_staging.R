@@ -425,11 +425,11 @@ ssgsea_df <- do.call(rbind, ssgsea_list)
 # 统一 BatCh-seq 对模块得分进行批次校正（而非基因表达）
 if (length(all_ssgsea_parts) >= 2) {
   batch_labels <- ssgsea_df$batch
-  timepoint_labels <- ssgsea_df$timepoint
+  tp_labels_combat <- ssgsea_df$timepoint
   module_mat <- as.matrix(ssgsea_df[, common_mod_cols, drop = FALSE])
 
   module_mat_corrected <- tryCatch({
-    ComBat(dat = t(module_mat), batch = batch_labels, mod = model.matrix(~1, data = data.frame(tp = timepoint_labels)))
+    ComBat(dat = t(module_mat), batch = batch_labels, mod = model.matrix(~1, data = data.frame(tp = tp_labels_combat)))
   }, error = function(e) {
     cat(sprintf("  模块得分 ComBat 校正失败: %s，使用原始值\n", e$message))
     t(module_mat)
@@ -442,8 +442,6 @@ if (length(all_ssgsea_parts) >= 2) {
   cat(sprintf("  模块得分 ComBat 校正完成: %d samples × %d modules\n", nrow(ssgsea_df), length(common_mod_cols)))
 }
 
-timepoint_labels <- ssgsea_df$timepoint
-batch_labels <- ssgsea_df$batch
 module_names <- common_mod_cols
 
 cat(sprintf("  合并后 ssGSEA 评分: %d samples × %d modules\n", nrow(ssgsea_df), length(common_mod_cols)))
@@ -487,20 +485,29 @@ cat(sprintf("  锚定共有基因: %d\n", length(common_anchor_genes)))
 
 if (length(common_anchor_genes) > 10) {
   merged_expr_list <- lapply(anchor_parts, function(x) x[common_anchor_genes, , drop = FALSE])
-  merged_expr_corrected <- do.call(cbind, merged_expr_list)
-  timepoint_labels <- c(
+    merged_expr_raw <- do.call(cbind, merged_expr_list)
+    batch_labels <- c(rep("GSE104036", ncol(anchor_parts[["GSE104036"]])),
+                      rep("GSE61616", ncol(anchor_parts[["GSE61616_7d"]])))
+
+    # 跨平台 ComBat 校正（RNA-seq log2-CPM vs 芯片强度不可直接比较）
+    merged_expr_corrected <- tryCatch({
+      ComBat(dat = merged_expr_raw, batch = batch_labels)
+    }, error = function(e) {
+      cat(sprintf("    锚定矩阵 ComBat 校正失败: %s，使用原始值\n", e$message))
+      merged_expr_raw
+    })
+    cat(sprintf("    锚定矩阵跨平台 ComBat 校正完成\n"))
+  anchor_tp_labels <- c(
     gse104036_timepoints[colnames(anchor_parts[["GSE104036"]])],
     rep("7d", ncol(anchor_parts[["GSE61616_7d"]]))
   )
-  batch_labels <- c(rep("GSE104036", ncol(anchor_parts[["GSE104036"]])),
-                    rep("GSE61616", ncol(anchor_parts[["GSE61616_7d"]])))
   built_merged_expr <- TRUE
   cat(sprintf("  锚定表达矩阵: %d genes X %d samples\n", nrow(merged_expr_corrected), ncol(merged_expr_corrected)))
-  cat(sprintf("  时间点: %s\n", paste(names(table(timepoint_labels)), table(timepoint_labels), sep = "=", collapse = ", ")))
+  cat(sprintf("  时间点: %s\n", paste(names(table(anchor_tp_labels)), table(anchor_tp_labels), sep = "=", collapse = ", ")))
 } else {
   cat("  锚定共有基因不足，降级使用 GSE104036 单独\n")
   merged_expr_corrected <- logcpm_104036
-  timepoint_labels <- gse104036_timepoints[colnames(logcpm_104036)]
+  anchor_tp_labels <- gse104036_timepoints[colnames(logcpm_104036)]
   batch_labels <- rep("GSE104036", ncol(logcpm_104036))
   built_merged_expr <- TRUE
 }
@@ -762,20 +769,41 @@ run_monocle3 <- function() {
         cds <- learn_graph(cds)
 
         # 使用 CytoTRACE 确定起点 (Seurat v5兼容)
+        cyto_ok <- TRUE
         cyto_score <- tryCatch({
           suppressPackageStartupMessages(library(CytoTRACE))
           expr_matrix <- get_counts(sub_seurat)
           cyto_res <- CytoTRACE(as.matrix(expr_matrix), ncores = 1)
           cyto_res$CytoTRACE
         }, error = function(e) {
-          cat("    CytoTRACE 失败，使用默认根节点\n")
-          rep(0.5, ncol(sub_seurat))
+          cat(sprintf("    CytoTRACE 失败: %s\n", e$message))
+          cyto_ok <<- FALSE
+          rep(NA_real_, ncol(sub_seurat))
         })
 
         names(cyto_score) <- colnames(sub_seurat)
-        max_val <- max(cyto_score, na.rm = TRUE)
-        root_cells <- names(cyto_score)[cyto_score == max_val & !is.na(cyto_score)]
-        cat(sprintf("    根节点: %d cells with max CytoTRACE = %.4f\n", length(root_cells), max_val))
+
+        if (!cyto_ok) {
+          early_markers <- intersect(c("Tnf", "Il1b", "Ccl2", "Fos"), rownames(sub_seurat))
+          if (length(early_markers) > 0) {
+            expr_mat <- get_counts(sub_seurat)
+            early_expr <- Matrix::colSums(expr_mat[early_markers, , drop = FALSE])
+            root_cells <- names(which.max(early_expr))
+            cat(sprintf("    替代根节点(早期炎症标记): %s (Tnf/Il1b/Ccl2等总表达最高)\n", root_cells))
+          } else {
+            umap_coords <- Embeddings(sub_seurat, "umap")
+            centroid_dist <- sqrt(rowSums(umap_coords^2))
+            root_cells <- names(which.min(centroid_dist))
+            cat(sprintf("    替代根节点(UMAP原点最近): %s\n", root_cells))
+          }
+          cat("    ⚠ CytoTRACE不可用，拟时序根节点由替代策略确定\n")
+          pseudotime_unreliable <- TRUE
+        } else {
+          max_val <- max(cyto_score, na.rm = TRUE)
+          root_cells <- names(cyto_score)[cyto_score == max_val & !is.na(cyto_score)]
+          cat(sprintf("    根节点: %d cells with max CytoTRACE = %.4f\n", length(root_cells), max_val))
+          pseudotime_unreliable <- FALSE
+        }
 
         cds <- order_cells(cds, root_cells = root_cells)
 
@@ -806,7 +834,8 @@ run_monocle3 <- function() {
           stages = stage_labels,
           cyto_score = cyto_score,
           cell_type = ct,
-          expression_matrix = get_counts(sub_seurat)
+          expression_matrix = get_counts(sub_seurat),
+          pseudotime_unreliable = pseudotime_unreliable
         )
 
         # 保存拟时序图
@@ -878,7 +907,6 @@ if (is.null(merged_expr_corrected) || !built_merged_expr) {
   anchor_tp_labels <- ssgsea_df$timepoint
 } else {
   anchor_expr <- merged_expr_corrected
-  anchor_tp_labels <- timepoint_labels
 }
 
 for (marker_name in names(ANCHOR_MARKERS)) {
@@ -968,9 +996,9 @@ for (marker_name in names(ANCHOR_MARKERS)) {
     expected_stage = expected,
     bulk_peak = ifelse(is.na(bulk_peak_stage), "NA", bulk_peak_stage),
     scRNA_peak = ifelse(length(sc_peak_stage) == 0, "NA", sc_peak_stage),
-    bulk_E_z = early_mean,
-    bulk_M_z = mid_mean,
-    bulk_L_z = late_mean,
+    bulk_E_mean_z = early_mean,
+    bulk_M_mean_z = mid_mean,
+    bulk_L_mean_z = late_mean,
     consistent = consistent,
     stringsAsFactors = FALSE
   ))
@@ -1090,14 +1118,16 @@ if (!anchor_passed) {
 
     cat(sprintf("  Bartlett's χ² = %.3f, df = %d, p = %.4f\n", chi_stat, df, p_value))
 
-    if (p_value < 0.05) {
+    if (is.na(p_value)) {
+      cat(sprintf("  CCA 显著性检验不可用 (Wilks' λ = %.4f, 数据维度不足)\n", wilks_lambda))
+      cat("  原因: 3行 × 6列的数据不足以支持稳健的 Bartlett 检验\n")
+    } else if (p_value < 0.05) {
       cat("  ✓ CCA 显著！\n")
-      # 最高相关分期对应
       cc1_sc <- cca_res$xcoef[, 1]
       cc1_bulk <- cca_res$ycoef[, 1]
       cat(sprintf("  最高相关系数: %.4f\n", cca_res$cor[1]))
     } else {
-      cat("  ⚠ CCA 不显著（p=%.4f），在论文中诚实声明:\n", p_value)
+      cat(sprintf("  ⚠ CCA 不显著（p=%.4f），在论文中诚实声明:\n", p_value))
       cat("  'CCA未提供显著分期证据，时序关联基于标记基因一致性'\n")
     }
 
@@ -1134,9 +1164,9 @@ run_cibersortx <- function() {
   micro_expr <- merged_expr_corrected[micro_markers, , drop = FALSE]
   micro_score <- colMeans(micro_expr, na.rm = TRUE)
 
-  tp_order <- intersect(time_order, unique(timepoint_labels))
+  tp_order <- intersect(time_order, unique(anchor_tp_labels))
   tp_means <- sapply(tp_order, function(tp) {
-    idx <- which(timepoint_labels == tp)
+    idx <- which(anchor_tp_labels == tp)
     mean(micro_score[idx], na.rm = TRUE)
   })
 
@@ -1315,7 +1345,7 @@ dev.off()
 # --- 6B. 标记基因一致性热图 ---
 pdf(file.path(FIGURE_DIR, "Fig_QualTCA_anchor_heatmap.pdf"), width = 10, height = 6)
 
-anchor_mat <- as.matrix(anchor_results[, c("bulk_E_z", "bulk_M_z", "bulk_L_z")])
+anchor_mat <- as.matrix(anchor_results[, c("bulk_E_mean_z", "bulk_M_mean_z", "bulk_L_mean_z")])
 rownames(anchor_mat) <- anchor_results$gene
 
 if (all(is.na(anchor_mat)) || all(is.infinite(as.matrix(anchor_mat)))) {
