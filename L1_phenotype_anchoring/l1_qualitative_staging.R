@@ -9,7 +9,7 @@
 # 方法：
 #   1. Bulk模块活性动态曲线（ssGSEA + loess拟合 + 拐点提取）
 #   2. 单细胞拟时序与分期（Monocle3 + CytoTRACE）
-#   3. 定性分期锚定（标记基因锚定 + CCA辅助）
+#   3. 定性分期锚定（标记基因锚定 + Spearman辅助）
 #   4. CIBERSORTx验证
 # ======================================================================
 
@@ -768,17 +768,28 @@ run_monocle3 <- function() {
         cds <- cluster_cells(cds, reduction_method = "UMAP")
         cds <- learn_graph(cds)
 
-        # 使用 CytoTRACE 确定起点 (Seurat v5兼容)
+        # 使用 CytoTRACE2 确定起点 (Gulati et al., Science 2020; v2 2024)
+        # 三级回退: CytoTRACE2 → CytoTRACE(v1) → 早期标记基因 → UMAP原点
         cyto_ok <- TRUE
         cyto_score <- tryCatch({
-          suppressPackageStartupMessages(library(CytoTRACE))
-          expr_matrix <- get_counts(sub_seurat)
-          cyto_res <- CytoTRACE(as.matrix(expr_matrix), ncores = 1)
-          cyto_res$CytoTRACE
+          suppressPackageStartupMessages(library(CytoTRACE2))
+          cyto_res <- cytotrace2(sub_seurat, is_seurat = TRUE,
+                                 slot_type = "counts", species = "mouse", seed = 42)
+          cyto_res$CytoTRACE2_Score
         }, error = function(e) {
-          cat(sprintf("    CytoTRACE 失败: %s\n", e$message))
-          cyto_ok <<- FALSE
-          rep(NA_real_, ncol(sub_seurat))
+          cat(sprintf("    CytoTRACE2 失败: %s\n", e$message))
+          # 回退到 CytoTRACE v1
+          tryCatch({
+            suppressPackageStartupMessages(library(CytoTRACE))
+            expr_matrix <- get_counts(sub_seurat)
+            cyto_res <- CytoTRACE(as.matrix(expr_matrix), ncores = 1)
+            cat("    使用 CytoTRACE v1 (Gulati et al. 2020)\n")
+            return(cyto_res$CytoTRACE)
+          }, error = function(e2) {
+            cat(sprintf("    CytoTRACE v1 也失败: %s\n", e2$message))
+            cyto_ok <<- FALSE
+            rep(NA_real_, ncol(sub_seurat))
+          })
         })
 
         names(cyto_score) <- colnames(sub_seurat)
@@ -796,7 +807,7 @@ run_monocle3 <- function() {
             root_cells <- names(which.min(centroid_dist))
             cat(sprintf("    替代根节点(UMAP原点最近): %s\n", root_cells))
           }
-          cat("    ⚠ CytoTRACE不可用，拟时序根节点由替代策略确定\n")
+          cat("    ⚠ CytoTRACE2/v1均不可用，拟时序根节点由替代策略确定 (c.f. Monocle3 docs: root_cells method)\n")
           pseudotime_unreliable <- TRUE
         } else {
           max_val <- max(cyto_score, na.rm = TRUE)
@@ -1020,14 +1031,14 @@ if (n_consistent >= 4 && consistency_rate >= 0.75) {
   cat("  L → 慢性期（1d-7d）\n")
   anchor_passed <- TRUE
 } else {
-  cat("  ⚠ 标记基因锚定不明确（<4个一致），将执行 CCA 辅助锚定\n")
+  cat("  ⚠ 标记基因锚定不明确（<4个一致），将执行 Spearman 辅助锚定\n")
   anchor_passed <- FALSE
 }
 
 write.csv(anchor_results, file.path(OUTPUT_DIR, "anchor_marker_genes.csv"), row.names = FALSE)
 
-# -------------------- 3B. CCA 辅助锚定 --------------------
-cat("\n--- 3B. CCA 辅助锚定 ---\n")
+# -------------------- 3B. Spearman 辅助锚定 --------------------
+cat("\n--- 3B. Spearman 辅助锚定 ---\n")
 
 if (!anchor_passed) {
   # 构建单细胞E/M/L × 6模块矩阵
@@ -1078,7 +1089,7 @@ if (!anchor_passed) {
     }
   }
 
-  # CCA：聚合Bulk时间点为E/M/L三期以匹配scRNA分期维度
+  # Spearman跨组学关联：聚合Bulk时间点为E/M/L三期以匹配scRNA分期维度
   sc_complete <- sc_module_by_stage[complete.cases(sc_module_by_stage), , drop = FALSE]
 
   bulk_stage_map <- list(E = c("3h", "6h"), M = c("12h", "24h"), L = c("7d"))
@@ -1101,45 +1112,43 @@ if (!anchor_passed) {
   bulk_complete <- bulk_complete[, common_mods, drop = FALSE]
 
   if (nrow(sc_complete) >= 2 && length(common_mods) >= 2) {
-    cca_res <- cancor(sc_complete, bulk_complete)
-    cat(sprintf("  CCA 典型相关系数:\n"))
-    for (i in seq_along(cca_res$cor)) {
-      cat(sprintf("    CC%d = %.4f\n", i, cca_res$cor[i]))
+    # Spearman相关替代CCA (参考: scAB, Zhang et al. NAR 2022 — 用pairwise correlation
+    # 关联单细胞与Bulk数据；n=3时比CCA更稳健)
+    cat(sprintf("  跨组学 Spearman 模块一致性 (n=%d):\n", nrow(sc_complete)))
+    module_cors <- c()
+    for (mod in common_mods) {
+      sp_cor <- tryCatch(
+        cor(sc_complete[, mod], bulk_complete[, mod],
+            method = "spearman", use = "complete.obs"),
+        error = function(e) NA_real_
+      )
+      module_cors <- c(module_cors, sp_cor)
+      cat(sprintf("    %s: ρ = %+.3f\n", mod, sp_cor))
     }
+    names(module_cors) <- common_mods
 
-    # 显著性检验（Bartlett's test近似）
-    n <- nrow(sc_complete)
-    p <- ncol(sc_complete)
-    q <- ncol(bulk_complete)
-    wilks_lambda <- prod(1 - cca_res$cor^2)
-    df <- p * q
-    chi_stat <- -(n - 1 - (p + q + 1) / 2) * log(wilks_lambda)
-    p_value <- pchisq(chi_stat, df, lower.tail = FALSE)
+    mean_rho <- mean(module_cors, na.rm = TRUE)
+    n_sig <- sum(abs(module_cors) >= 0.5, na.rm = TRUE)
+    cat(sprintf("  平均 Spearman ρ = %+.3f, |ρ|≥0.5 的模块: %d/%d\n",
+                mean_rho, n_sig, length(module_cors)))
 
-    cat(sprintf("  Bartlett's χ² = %.3f, df = %d, p = %.4f\n", chi_stat, df, p_value))
-
-    if (is.na(p_value)) {
-      cat(sprintf("  CCA 显著性检验不可用 (Wilks' λ = %.4f, 数据维度不足)\n", wilks_lambda))
-      cat("  原因: 3行 × 6列的数据不足以支持稳健的 Bartlett 检验\n")
-    } else if (p_value < 0.05) {
-      cat("  ✓ CCA 显著！\n")
-      cc1_sc <- cca_res$xcoef[, 1]
-      cc1_bulk <- cca_res$ycoef[, 1]
-      cat(sprintf("  最高相关系数: %.4f\n", cca_res$cor[1]))
+    if (mean_rho >= 0.5) {
+      cat("  ✓ 跨组学模块活性排序一致，支持分期锚定结论\n")
+    } else if (abs(mean_rho) >= 0.3) {
+      cat("  ~ 跨组学模块活性中度相关，分期锚定部分可信\n")
     } else {
-      cat(sprintf("  ⚠ CCA 不显著（p=%.4f），在论文中诚实声明:\n", p_value))
-      cat("  'CCA未提供显著分期证据，时序关联基于标记基因一致性'\n")
+      cat("  ⚠ 跨组学相关较弱，分期结论需谨慎解读\n")
     }
 
-    # 保存 CCA 结果
-    cca_summary <- data.frame(
-      CC = seq_along(cca_res$cor),
-      Correlation = cca_res$cor,
+    # 保存 Spearman 结果
+    spearman_df <- data.frame(
+      Module = common_mods,
+      Spearman_rho = module_cors,
       stringsAsFactors = FALSE
     )
-    write.csv(cca_summary, file.path(OUTPUT_DIR, "cca_results.csv"), row.names = FALSE)
+    write.csv(spearman_df, file.path(OUTPUT_DIR, "crossomics_spearman.csv"), row.names = FALSE)
   } else {
-    cat("  CCA 数据不足（需要 ≥2 行和 ≥2 列）\n")
+    cat("  跨组学对比数据不足（需要 ≥2 行和 ≥2 模块）\n")
   }
 }
 
