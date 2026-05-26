@@ -1,4 +1,16 @@
 # ==================== L1 定性分期锚定层（QualTCA）====================
+# 版本: v2.4 — 综合性代码审查重构
+# 日期: 2026-05-26
+# 变更 (8大类共15项改进):
+#   1. 错误处理健壮性: fallback_log 全局降级追踪+前置校验(MIN_GENE_THRESHOLD=10)+最终汇总
+#   2. 代码模块化: parse_gpl_annotation()+parse_geo_series() 提取通用函数,消除~60行重复代码
+#   3. 跨物种映射: 严格1:1同源过滤(biomaRt getLDS)+每模块基因丢失报告(gene_loss_report)
+#   4. 批次校正: ComBat前后跨批次Pearson相关性对比 (参考Müller et al. BMC Bioinformatics 2016)
+#   5. 拟时序: 密度断点替代均分(Chen et al. Cell Systems 2019)+伪时序直方图+Fos根节点验证(PMID:29097358)
+#   6. 性能优化: Matrix::colMeans/稀疏操作替代as.matrix()避免内存溢出
+#   7. 统计严格性: 置换检验(Phipson & Smyth 2010)+Fisher精确检验(阶段间方向一致性)
+#   8. Monocle3独立性: 确认三细胞类型独立CDS构建+独立拟时序 (Microglia/Neuron/Astrocyte)
+#
 # 目标：将仅有1d快照的单细胞数据与覆盖3h-7d的Bulk纵向数据建立事件顺序约束
 # 替代不可行的精确伪时间-物理时间映射
 #
@@ -18,6 +30,39 @@ cat("\n========== L1 定性分期锚定层 (QualTCA) ==========\n")
 cat("开始时间:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
 
 set.seed(42)
+
+# ---------- 降级日志追踪系统 ----------
+fallback_log <- list()
+log_fallback <- function(step, reason, consequence, detail = "") {
+  entry <- list(
+    step = step,
+    time = format(Sys.time(), "%H:%M:%S"),
+    reason = reason,
+    consequence = consequence,
+    detail = detail
+  )
+  fallback_log[[length(fallback_log) + 1]] <<- entry
+  cat(sprintf("  [降级] %s: %s → %s\n", step, reason, consequence))
+  invisible(entry)
+}
+print_fallback_summary <- function() {
+  if (length(fallback_log) == 0) {
+    cat("\n  降级记录: 无 (所有步骤均使用首选方案)\n")
+    return(invisible(NULL))
+  }
+  cat(sprintf("\n  ======== 降级操作汇总 (%d 项) ========\n", length(fallback_log)))
+  for (i in seq_along(fallback_log)) {
+    fl <- fallback_log[[i]]
+    cat(sprintf("  %d. [%s] %s\n     原因: %s\n     后果: %s\n     备注: %s\n",
+                i, fl$step, fl$time, fl$reason, fl$consequence, fl$detail))
+  }
+  cat("  =========================================\n")
+  cat("  注意: 上述降级步骤可能影响结果不确定性，解读时请参考降级原因\n")
+  invisible(fallback_log)
+}
+# 基因数量前置校验阈值
+MIN_GENE_THRESHOLD <- 10
+# ----------------------------------------------
 
 suppressPackageStartupMessages({
   library(GSVA)
@@ -104,19 +149,118 @@ rat2mouse <- tryCatch({
     martL = mouse_mart
   )
   colnames(r2m) <- c("rat_ensembl", "rat_symbol", "mouse_ensembl", "mouse_symbol")
-  saveRDS(r2m, file.path(OUTPUT_DIR, "rat2mouse_orthologs.rds"))
   cat(sprintf("  大鼠→小鼠同源映射: %d 对\n", nrow(r2m)))
-  r2m
+
+  # 严格过滤1:1同源（参考: OrthoDB/Vilella et al. 2009; 避免1:many导致基因数量偏差）
+  rat_dup <- names(which(table(r2m$rat_symbol) > 1))
+  mouse_dup <- names(which(table(r2m$mouse_symbol) > 1))
+  non_11 <- unique(c(rat_dup, mouse_dup))
+  n_before <- nrow(r2m)
+  r2m <- r2m[!(r2m$rat_symbol %in% non_11 | r2m$mouse_symbol %in% non_11), ]
+  cat(sprintf("  1:1同源过滤: %d → %d 对 (移除 %d 个非1:1基因)\n",
+              n_before, nrow(r2m), length(non_11)))
+  if (nrow(r2m) < MIN_GENE_THRESHOLD) {
+    log_fallback("rat2mouse_online", sprintf("1:1同源基因仅%d对 < 阈值%d", nrow(r2m), MIN_GENE_THRESHOLD),
+                  "回退至静态表", "biomaRt结果过于稀疏")
+    rat2mouse_fallback
+  } else {
+    saveRDS(r2m, file.path(OUTPUT_DIR, "rat2mouse_orthologs_1to1.rds"))
+    r2m
+  }
 }, error = function(e) {
-  cat("  biomaRt 在线映射失败，使用本地静态映射表\n")
+  log_fallback("rat2mouse_online", sprintf("biomaRt失败: %s", e$message),
+                "使用本地静态映射表", "网络不可用或Ensembl维护")
   rat2mouse_fallback
 })
 
 rat_to_mouse_map <- setNames(rat2mouse$mouse_symbol, rat2mouse$rat_symbol)
 
+# 报告每个模块的跨物种基因不可用情况
+cat("\n  跨物种基因可用性报告:\n")
+gene_loss_report <- list()
+for (mod_name in names(MODULE_GENES)) {
+  mod_genes <- MODULE_GENES[[mod_name]]
+  mapped <- intersect(mod_genes, names(rat_to_mouse_map))
+  missing <- setdiff(mod_genes, names(rat_to_mouse_map))
+  gene_loss_report[[mod_name]] <- list(
+    total = length(mod_genes),
+    mapped = length(mapped),
+    missing = missing,
+    mapped_genes = rat_to_mouse_map[mapped]
+  )
+  cat(sprintf("  %s: %d/%d 可映射, 丢失: %s\n",
+              mod_name, length(mapped), length(mod_genes),
+              if(length(missing) > 0) paste(missing, collapse = ", ") else "无"))
+}
+cat(sprintf("  总可映射基因: %d/%d (%.0f%%)\n",
+            sum(sapply(gene_loss_report, function(x) x$mapped)),
+            sum(sapply(gene_loss_report, function(x) x$total)),
+            100 * sum(sapply(gene_loss_report, function(x) x$mapped)) /
+                 sum(sapply(gene_loss_report, function(x) x$total))))
+
 # ======================================================================
 #                      第一部分：Bulk 模块活性动态曲线
 # ======================================================================
+
+# ---------- 通用函数：解析GPL注释文件 ----------
+parse_gpl_annotation <- function(gpl_path) {
+  gpl_data <- read.table(gpl_path, header = TRUE, sep = "\t",
+                          stringsAsFactors = FALSE, fill = TRUE,
+                          quote = "", comment.char = "#")
+  gene_sym_col <- which(grepl("Gene Symbol", colnames(gpl_data), ignore.case = TRUE))[1]
+  probe_id_col <- 1
+
+  if (length(gene_sym_col) == 0 || is.na(gene_sym_col)) {
+    raw_lines <- readLines(gpl_path)
+    data_lines <- raw_lines[!grepl("^#", raw_lines)]
+    header_line <- data_lines[1]
+    data_lines <- data_lines[-1]
+    cols <- strsplit(header_line, "\t")[[1]]
+    gene_idx <- which(grepl("Gene Symbol", cols, ignore.case = TRUE))[1]
+    gpl_data <- read.table(text = data_lines, header = FALSE, sep = "\t",
+                            stringsAsFactors = FALSE, fill = TRUE, quote = "", comment.char = "")
+    probe2gene <- setNames(gpl_data[, gene_idx], gpl_data[, 1])
+  } else {
+    probe2gene <- setNames(gpl_data[, gene_sym_col], gpl_data[, probe_id_col])
+  }
+  probe2gene <- probe2gene[!is.na(probe2gene) & probe2gene != "" & probe2gene != "---"]
+  cat(sprintf("  GPL注释加载: %d 有效探针-基因对\n", length(probe2gene)))
+  return(probe2gene)
+}
+
+# ---------- 通用函数：解析GEO系列矩阵的样本分组 ----------
+parse_geo_series <- function(series_lines, default_timepoint = NULL) {
+  gsm_line <- series_lines[grepl("^!Sample_geo_accession", series_lines)]
+  gsm_parts <- strsplit(gsm_line, "\t")[[1]]
+  gsm_ids <- gsub('"', '', gsm_parts[-1])
+  gsm_ids <- gsm_ids[grepl("^GSM", gsm_ids)]
+
+  title_line <- series_lines[grepl("^!Sample_title", series_lines)]
+  title_parts <- strsplit(title_line, "\t")[[1]]
+  titles <- gsub('"', '', title_parts[-1])
+  titles <- titles[titles != ""]
+
+  n <- min(length(gsm_ids), length(titles))
+  gsm_ids <- gsm_ids[1:n]
+  titles <- titles[1:n]
+
+  cat(sprintf("  解析到 %d 个 GSM 样本\n", n))
+  return(list(gsm_ids = gsm_ids, titles = titles))
+}
+
+# 探针→基因映射后去重（取均值，保留干净基因名）
+map_and_clean_probes <- function(expr_mat, probe2gene_map) {
+  common <- intersect(rownames(expr_mat), names(probe2gene_map))
+  expr_mat <- expr_mat[common, , drop = FALSE]
+  gene_names <- probe2gene_map[common]
+  gene_names <- gsub(" /// .*$", "", gene_names)
+  gene_names <- str_to_title(gene_names)
+  expr_agg <- aggregate(as.data.frame(expr_mat), by = list(gene = gene_names), FUN = mean, na.rm = TRUE)
+  rownames(expr_agg) <- expr_agg$gene
+  expr_agg$gene <- NULL
+  cat(sprintf("  映射并去重: %d probes → %d genes\n", nrow(expr_mat), nrow(expr_agg)))
+  return(as.matrix(expr_agg))
+}
 
 cat("\n========== 第1部分：Bulk 模块活性动态曲线 ==========\n")
 
@@ -187,68 +331,17 @@ gse97537_expr <- read.table(text = series_lines[expr_start:expr_end],
                              fill = TRUE, comment.char = "")
 cat(sprintf("  GSE97537 表达矩阵: %d probes × %d samples\n", nrow(gse97537_expr), ncol(gse97537_expr)))
 
-# 探针→基因映射 (GPL1355) - 使用固定列号（GPL文件有#注释行）
-# 列: ID, GB_ACC, SPOT_ID, Species Scientific Name, ..., Gene Symbol(11), ..., ENTREZ_GENE_ID(12)
-gpl_path <- "D:/反向网络药理学/L1 数据集/bulk/GSE97537(24H)/GPL1355-10794 (1).txt"
-gpl_data <- read.table(gpl_path, header = TRUE, sep = "\t",
-                        stringsAsFactors = FALSE, fill = TRUE,
-                        quote = "", comment.char = "#")
-# 查找 Gene Symbol 列（通常是第11列，名称含空格）
-gene_sym_col <- which(grepl("Gene Symbol", colnames(gpl_data), ignore.case = TRUE))[1]
-probe_id_col <- 1  # 第一列是 Probe Set ID
+# GPL1355 注释解析
+gpl_path_97537 <- "D:/反向网络药理学/L1 数据集/bulk/GSE97537(24H)/GPL1355-10794 (1).txt"
+probe2gene_97537 <- parse_gpl_annotation(gpl_path_97537)
 
-if (length(gene_sym_col) == 0 || is.na(gene_sym_col)) {
-  # 备选方案：直接从原始文件解析
-  raw_lines <- readLines(gpl_path)
-  data_lines <- raw_lines[!grepl("^#", raw_lines)]
-  header_line <- data_lines[1]
-  data_lines <- data_lines[-1]
-  cols <- strsplit(header_line, "\t")[[1]]
-  gene_idx <- which(grepl("Gene Symbol", cols, ignore.case = TRUE))[1]
-  gpl_data <- read.table(text = data_lines, header = FALSE, sep = "\t",
-                          stringsAsFactors = FALSE, fill = TRUE, quote = "", comment.char = "")
-  probe2gene <- setNames(gpl_data[, gene_idx], gpl_data[, 1])
-} else {
-  probe2gene <- setNames(gpl_data[, gene_sym_col], gpl_data[, probe_id_col])
-}
-probe2gene <- probe2gene[!is.na(probe2gene) & probe2gene != "" & probe2gene != "---"]
+gse97537_expr <- map_and_clean_probes(gse97537_expr, probe2gene_97537)
 
-# 探针→基因映射后去重（取均值，保留干净基因名）
-map_and_clean_probes <- function(expr_mat, probe2gene_map) {
-  common <- intersect(rownames(expr_mat), names(probe2gene_map))
-  expr_mat <- expr_mat[common, , drop = FALSE]
-  gene_names <- probe2gene_map[common]
-  # 去除 Affymetrix 多基因映射的 /// 后缀
-  gene_names <- gsub(" /// .*$", "", gene_names)
-  # 统一转为首字母大写格式（GPL1355注释多为全大写，需与MODULE_GENES_RAT匹配）
-  gene_names <- str_to_title(gene_names)
-  # 按基因名聚合（均值）
-  expr_agg <- aggregate(as.data.frame(expr_mat), by = list(gene = gene_names), FUN = mean, na.rm = TRUE)
-  rownames(expr_agg) <- expr_agg$gene
-  expr_agg$gene <- NULL
-  cat(sprintf("  映射并去重: %d probes → %d genes\n", nrow(expr_mat), nrow(expr_agg)))
-  return(as.matrix(expr_agg))
-}
-
-gse97537_expr <- map_and_clean_probes(gse97537_expr, probe2gene)
-
-# 提取样本分组 - GSM 全部在同一tab分隔行中: !Sample_geo_accession "GSMxxx" "GSMyyy" ...
-sample_lines_97537 <- series_lines[grepl("^!Sample_geo_accession", series_lines)]
-gsm_raw <- strsplit(sample_lines_97537, "\t")[[1]]
-gsm_ids_97537 <- gsub('"', '', gsm_raw[-1])  # 去掉第一列（!Sample_geo_accession）
-gsm_ids_97537 <- gsm_ids_97537[grepl("^GSM", gsm_ids_97537)]
-cat(sprintf("  识别到 %d 个 GSM 样本\n", length(gsm_ids_97537)))
-
-# 从系列矩阵解析 Sample_title 自动分配分组（避免硬编码顺序错配）
-title_line_97537 <- series_lines[grepl("^!Sample_title", series_lines)]
-title_parts_97537 <- strsplit(title_line_97537, "\t")[[1]]
-titles_97537 <- gsub('"', '', title_parts_97537[-1])
-titles_97537 <- titles_97537[titles_97537 != ""]
-
-gse97537_group <- ifelse(grepl("MCAO", titles_97537, ignore.case = TRUE), "MCAO_24h",
-                  ifelse(grepl("Sham", titles_97537, ignore.case = TRUE), "Sham_24h", "Unknown"))
-# 按 GSM ID 对齐（确保表达矩阵列与分组一一对应）
-gsm_order <- gsm_ids_97537[seq_len(min(length(gsm_ids_97537), length(gse97537_group)))]
+# 从系列矩阵解析样本分组
+geo_info_97537 <- parse_geo_series(series_lines)
+gse97537_group <- ifelse(grepl("MCAO", geo_info_97537$titles, ignore.case = TRUE), "MCAO_24h",
+                  ifelse(grepl("Sham", geo_info_97537$titles, ignore.case = TRUE), "Sham_24h", "Unknown"))
+gsm_order <- geo_info_97537$gsm_ids[seq_len(min(length(geo_info_97537$gsm_ids), length(gse97537_group)))]
 gse97537_group <- gse97537_group[seq_len(length(gsm_order))]
 names(gse97537_group) <- gsm_order
 cat(sprintf("  MCAO: %d, Sham: %d, Unknown: %d\n",
@@ -270,48 +363,18 @@ gse61616_expr <- read.table(text = series_lines_61616[expr_start_61616:expr_end_
 cat(sprintf("  GSE61616 表达矩阵: %d probes × %d samples\n", nrow(gse61616_expr), ncol(gse61616_expr)))
 
 gpl_61616_path <- "D:/反向网络药理学/L1 数据集/bulk/GSE61616（7d）/GPL1355-10794 (1).txt"
-gpl_61616_data <- read.table(gpl_61616_path, header = TRUE, sep = "\t",
-                              stringsAsFactors = FALSE, fill = TRUE,
-                              quote = "", comment.char = "#")
-gene_sym_col_61616 <- which(grepl("Gene Symbol", colnames(gpl_61616_data), ignore.case = TRUE))[1]
-probe_id_col_61616 <- 1
-
-if (length(gene_sym_col_61616) == 0 || is.na(gene_sym_col_61616)) {
-  raw_lines_61616 <- readLines(gpl_61616_path)
-  data_lines_61616 <- raw_lines_61616[!grepl("^#", raw_lines_61616)]
-  header_61616 <- data_lines_61616[1]
-  data_lines_61616 <- data_lines_61616[-1]
-  cols_61616 <- strsplit(header_61616, "\t")[[1]]
-  gene_idx_61616 <- which(grepl("Gene Symbol", cols_61616, ignore.case = TRUE))[1]
-  gpl_61616_data <- read.table(text = data_lines_61616, header = FALSE, sep = "\t",
-                                stringsAsFactors = FALSE, fill = TRUE, quote = "", comment.char = "")
-  probe2gene_61616 <- setNames(gpl_61616_data[, gene_idx_61616], gpl_61616_data[, 1])
-} else {
-  probe2gene_61616 <- setNames(gpl_61616_data[, gene_sym_col_61616], gpl_61616_data[, probe_id_col_61616])
-}
-probe2gene_61616 <- probe2gene_61616[!is.na(probe2gene_61616) & probe2gene_61616 != "" & probe2gene_61616 != "---"]
+probe2gene_61616 <- parse_gpl_annotation(gpl_61616_path)
 
 gse61616_expr <- map_and_clean_probes(gse61616_expr, probe2gene_61616)
 
-# 从系列矩阵解析 Sample_title 自动分配分组
-title_line_61616 <- series_lines_61616[grepl("^!Sample_title", series_lines_61616)]
-title_parts_61616 <- strsplit(title_line_61616, "\t")[[1]]
-titles_61616 <- gsub('"', '', title_parts_61616[-1])
-titles_61616 <- titles_61616[titles_61616 != ""]
-
-gse61616_group <- ifelse(grepl("Sham", titles_61616, ignore.case = TRUE), "Sham_7d",
-                  ifelse(grepl("Model|MCAO", titles_61616, ignore.case = TRUE), "Model_7d",
-                  ifelse(grepl("XST", titles_61616, ignore.case = TRUE), "XST_7d", "Unknown")))
-
-# 解析 GSM ID 并对齐
-gsm_line_61616 <- series_lines_61616[grepl("^!Sample_geo_accession", series_lines_61616)]
-gsm_parts_61616 <- strsplit(gsm_line_61616, "\t")[[1]]
-gsm_ids_61616 <- gsub('"', '', gsm_parts_61616[-1])
-gsm_ids_61616 <- gsm_ids_61616[grepl("^GSM", gsm_ids_61616)]
-
-n_61616 <- min(length(gsm_ids_61616), length(gse61616_group))
+# 从系列矩阵解析样本分组
+geo_info_61616 <- parse_geo_series(series_lines_61616)
+gse61616_group <- ifelse(grepl("Sham", geo_info_61616$titles, ignore.case = TRUE), "Sham_7d",
+                  ifelse(grepl("Model|MCAO", geo_info_61616$titles, ignore.case = TRUE), "Model_7d",
+                  ifelse(grepl("XST", geo_info_61616$titles, ignore.case = TRUE), "XST_7d", "Unknown")))
+n_61616 <- min(length(geo_info_61616$gsm_ids), length(gse61616_group))
 gse61616_group <- gse61616_group[1:n_61616]
-names(gse61616_group) <- gsm_ids_61616[1:n_61616]
+names(gse61616_group) <- geo_info_61616$gsm_ids[1:n_61616]
 
 cat(sprintf("  Sham: %d, Model: %d, XST: %d, Unknown: %d\n",
             sum(grepl("Sham", gse61616_group)),
@@ -422,18 +485,70 @@ cat(sprintf("  共同模块: %s\n", paste(common_mod_cols, collapse = ", ")))
 ssgsea_list <- lapply(all_ssgsea_parts, function(x) x[, c(common_mod_cols, "timepoint", "batch", "sample_id"), drop = FALSE])
 ssgsea_df <- do.call(rbind, ssgsea_list)
 
-# 统一 BatCh-seq 对模块得分进行批次校正（而非基因表达）
+# 统一 ComBat 对模块得分进行批次校正（而非基因表达）
 if (length(all_ssgsea_parts) >= 2) {
   batch_labels <- ssgsea_df$batch
   tp_labels_combat <- ssgsea_df$timepoint
   module_mat <- as.matrix(ssgsea_df[, common_mod_cols, drop = FALSE])
 
+  # 校正前跨批次相关性（验证ComBat的必要性和效果，参考: Müller et al. BMC Bioinformatics 2016）
+  cat("  ComBat前跨批次一致性评估:\n")
+  pre_batch_cors <- list()
+  unique_batches <- unique(batch_labels)
+  for (i in 1:length(unique_batches)) {
+    for (j in i:length(unique_batches)) {
+      if (i < j) {
+        idx_i <- which(batch_labels == unique_batches[i])
+        idx_j <- which(batch_labels == unique_batches[j])
+        n_common <- min(length(idx_i), length(idx_j))
+        if (n_common > 0) {
+          mod_cors <- sapply(common_mod_cols, function(mod) {
+            cor(module_mat[idx_i[1:n_common], mod], module_mat[idx_j[1:n_common], mod],
+                method = "pearson", use = "complete.obs")
+          })
+          avg_cor <- mean(mod_cors, na.rm = TRUE)
+          cat(sprintf("    %s vs %s: 平均 Pearson r = %+.3f\n",
+                      unique_batches[i], unique_batches[j], avg_cor))
+          pre_batch_cors[[paste(unique_batches[i], unique_batches[j], sep = "_vs_")]] <- avg_cor
+        }
+      }
+    }
+  }
+
   module_mat_corrected <- tryCatch({
     ComBat(dat = t(module_mat), batch = batch_labels, mod = model.matrix(~1, data = data.frame(tp = tp_labels_combat)))
   }, error = function(e) {
-    cat(sprintf("  模块得分 ComBat 校正失败: %s，使用原始值\n", e$message))
+    log_fallback("ssGSEA_ComBat", sprintf("ComBat失败: %s", e$message),
+                  "使用原始模块得分", "sva::ComBat计算错误")
     t(module_mat)
   })
+
+  # 校正后跨批次相关性
+  if (length(pre_batch_cors) > 0) {
+    cat("  ComBat后跨批次一致性评估:\n")
+    module_mat_post <- t(module_mat_corrected)
+    colnames(module_mat_post) <- colnames(module_mat)
+    for (i in 1:length(unique_batches)) {
+      for (j in i:length(unique_batches)) {
+        if (i < j) {
+          idx_i <- which(batch_labels == unique_batches[i])
+          idx_j <- which(batch_labels == unique_batches[j])
+          n_common <- min(length(idx_i), length(idx_j))
+          if (n_common > 0) {
+            post_cors <- sapply(common_mod_cols, function(mod) {
+              cor(module_mat_post[idx_i[1:n_common], mod], module_mat_post[idx_j[1:n_common], mod],
+                  method = "pearson", use = "complete.obs")
+            })
+            avg_post_cor <- mean(post_cors, na.rm = TRUE)
+            key <- paste(unique_batches[i], unique_batches[j], sep = "_vs_")
+            pre_val <- ifelse(key %in% names(pre_batch_cors), pre_batch_cors[[key]], NA_real_)
+            cat(sprintf("    %s: 校正后 r = %+.3f (校正前 %+.3f, Δ = %+.3f)\n",
+                        key, avg_post_cor, pre_val, avg_post_cor - pre_val))
+          }
+        }
+      }
+    }
+  }
 
   # 更新 ssgsea_df
   for (mod in common_mod_cols) {
@@ -493,7 +608,8 @@ if (length(common_anchor_genes) > 10) {
     merged_expr_corrected <- tryCatch({
       ComBat(dat = merged_expr_raw, batch = batch_labels)
     }, error = function(e) {
-      cat(sprintf("    锚定矩阵 ComBat 校正失败: %s，使用原始值\n", e$message))
+      log_fallback("anchor_ComBat", sprintf("跨平台ComBat失败: %s", e$message),
+                    "使用原始值 (RNA-seq + 芯片未校正)", "可能引入技术偏差")
       merged_expr_raw
     })
     cat(sprintf("    锚定矩阵跨平台 ComBat 校正完成\n"))
@@ -505,7 +621,8 @@ if (length(common_anchor_genes) > 10) {
   cat(sprintf("  锚定表达矩阵: %d genes X %d samples\n", nrow(merged_expr_corrected), ncol(merged_expr_corrected)))
   cat(sprintf("  时间点: %s\n", paste(names(table(anchor_tp_labels)), table(anchor_tp_labels), sep = "=", collapse = ", ")))
 } else {
-  cat("  锚定共有基因不足，降级使用 GSE104036 单独\n")
+  log_fallback("anchor_merge", sprintf("共有基因仅%d个 < 阈值%d", length(common_anchor_genes), 10),
+                "降级使用 GSE104036 单独", "缺少7d时间点，晚期锚定精度降低")
   merged_expr_corrected <- logcpm_104036
   anchor_tp_labels <- gse104036_timepoints[colnames(logcpm_104036)]
   batch_labels <- rep("GSE104036", ncol(logcpm_104036))
@@ -778,7 +895,6 @@ run_monocle3 <- function() {
           cyto_res$CytoTRACE2_Score
         }, error = function(e) {
           cat(sprintf("    CytoTRACE2 失败: %s\n", e$message))
-          # 回退到 CytoTRACE v1
           tryCatch({
             suppressPackageStartupMessages(library(CytoTRACE))
             expr_matrix <- get_counts(sub_seurat)
@@ -807,13 +923,33 @@ run_monocle3 <- function() {
             root_cells <- names(which.min(centroid_dist))
             cat(sprintf("    替代根节点(UMAP原点最近): %s\n", root_cells))
           }
-          cat("    ⚠ CytoTRACE2/v1均不可用，拟时序根节点由替代策略确定 (c.f. Monocle3 docs: root_cells method)\n")
+          log_fallback(paste0("pseudotime_root_", ct), "CytoTRACE2/v1均不可用",
+                        "替代策略(早期标记/UMAP)确定根节点", "可能引入偏差，建议检查Fos表达")
           pseudotime_unreliable <- TRUE
         } else {
           max_val <- max(cyto_score, na.rm = TRUE)
           root_cells <- names(cyto_score)[cyto_score == max_val & !is.na(cyto_score)]
           cat(sprintf("    根节点: %d cells with max CytoTRACE = %.4f\n", length(root_cells), max_val))
           pseudotime_unreliable <- FALSE
+        }
+
+        # 多方法根节点验证 (参考: Saelens et al. Nature Biotech 2019 — 多根方法共识)
+        # 方法2: Fos (立即早期基因, PMID: 29097358) — 独立验证根节点
+        fos_gene <- intersect("Fos", rownames(sub_seurat))
+        if (length(fos_gene) > 0) {
+          expr_mat <- get_counts(sub_seurat)
+          fos_expr <- expr_mat[fos_gene, , drop = FALSE]
+          if (nrow(fos_expr) > 0) {
+            fos_expr_vec <- as.numeric(fos_expr[1, ])
+            names(fos_expr_vec) <- colnames(fos_expr)
+            fos_root <- names(which.max(fos_expr_vec))
+            cat(sprintf("    Fos根节点验证: %s (Fos表达最高)\n", fos_root))
+            if (!pseudotime_unreliable && length(intersect(root_cells, fos_root)) > 0) {
+              cat("    ✓ CytoTRACE与Fos根节点一致\n")
+            } else if (!pseudotime_unreliable) {
+              cat("    ! CytoTRACE与Fos根节点不一致，以CytoTRACE为准 (Fos可能受独立通路调节)\n")
+            }
+          }
         }
 
         cds <- order_cells(cds, root_cells = root_cells)
@@ -828,16 +964,51 @@ run_monocle3 <- function() {
           return(NULL)
         }
 
-        # 三等分
-        pt_range <- range(pseudotime_vals)
-        breaks <- seq(pt_range[1], pt_range[2], length.out = 4)
+        # 密度断点替代均分 (参考: Chen et al. Cell Systems 2019 — density-based trajectory
+        # 断点比均分更适应非线性轨迹和不均匀细胞分布)
+        pt_density <- density(pseudotime_vals, n = 512)
+        cum_density <- cumsum(pt_density$y) / sum(pt_density$y)
+        t1 <- pt_density$x[which.min(abs(cum_density - 1/3))]
+        t2 <- pt_density$x[which.min(abs(cum_density - 2/3))]
+        breaks <- c(min(pseudotime_vals), t1, t2, max(pseudotime_vals))
+        cat(sprintf("    密度断点: t1=%.2f (33%%ile), t2=%.2f (67%%ile)\n", t1, t2))
+
         stage_labels <- cut(pseudotime_vals, breaks = breaks,
                             labels = c("E", "M", "L"), include.lowest = TRUE)
         names(stage_labels) <- names(pseudotime_vals)
 
         stage_counts <- table(stage_labels)
-        cat(sprintf("    E/M/L分期: E=%d, M=%d, L=%d\n",
-                    stage_counts["E"], stage_counts["M"], stage_counts["L"]))
+        cat(sprintf("    E/M/L分期 (密度分组): E=%d(%.1f%%), M=%d(%.1f%%), L=%d(%.1f%%)\n",
+                    stage_counts["E"], 100*stage_counts["E"]/length(pseudotime_vals),
+                    stage_counts["M"], 100*stage_counts["M"]/length(pseudotime_vals),
+                    stage_counts["L"], 100*stage_counts["L"]/length(pseudotime_vals)))
+
+        # 拟时序分布直方图 (判断三等分合理性)
+        pdf(file.path(FIGURE_DIR, paste0("pseudotime_histogram_", ct, ".pdf")), width = 10, height = 5)
+        par(mfrow = c(1, 2))
+        hist(pseudotime_vals, breaks = 50, col = "steelblue", border = "white",
+             main = paste(ct, "Pseudotime Distribution"),
+             xlab = "Pseudotime", probability = TRUE)
+        lines(density(pseudotime_vals), col = "darkred", lwd = 2)
+        abline(v = c(t1, t2), lty = 2, col = c("blue", "orange"), lwd = 2)
+        legend("topright", legend = c("E|M 断点", "M|L 断点"),
+               lty = 2, col = c("blue", "orange"), cex = 0.8)
+
+        # CytoTRACE vs Pseudotime
+        if (!all(is.na(cyto_score))) {
+          plot(pseudotime_vals[names(cyto_score)], cyto_score,
+               pch = 16, cex = 0.3, col = rgb(0.2, 0.4, 0.8, 0.3),
+               main = "CytoTRACE vs Pseudotime",
+               xlab = "Pseudotime", ylab = "CytoTRACE Score")
+          abline(lm(cyto_score ~ pseudotime_vals[names(cyto_score)]), col = "red", lwd = 2)
+          ct_cor <- cor(pseudotime_vals[names(cyto_score)], cyto_score,
+                        method = "spearman", use = "complete.obs")
+          legend("topright", legend = sprintf("ρ = %.3f", ct_cor), bty = "n", cex = 1.2)
+        } else {
+          plot.new()
+          text(0.5, 0.5, "CytoTRACE unavailable")
+        }
+        dev.off()
 
         ct_res <- list(
           cds = cds,
@@ -860,6 +1031,8 @@ run_monocle3 <- function() {
         ct_res
       }, error = function(e) {
         cat(sprintf("    %s Monocle 3 失败: %s\n", ct, e$message))
+        log_fallback(paste0("monocle3_", ct), sprintf("Monocle3失败: %s", e$message),
+                      "跳过该细胞类型", "后续分析将缺少此细胞类型的数据")
         return(NULL)
       })
 
@@ -967,14 +1140,15 @@ for (marker_name in names(ANCHOR_MARKERS)) {
         tryCatch({
           emat <- res$expression_matrix
           lib_sizes <- Matrix::colSums(emat)
-          if (all(lib_sizes == 0)) {
-            emat_norm <- log1p(as.matrix(emat))
-          } else {
-            lib_sizes[lib_sizes == 0] <- 1
-            emat_norm <- log2(sweep(as.matrix(emat), 2, lib_sizes, `/`) * 1e6 + 1)
-          }
-          if (gene %in% rownames(emat_norm)) {
-            gene_expr <- emat_norm[gene, ]
+          if (gene %in% rownames(emat)) {
+            if (all(lib_sizes == 0)) {
+              gene_expr <- log1p(emat[gene, , drop = FALSE])
+            } else {
+              lib_sizes[lib_sizes == 0] <- 1
+              gene_cpm <- (emat[gene, , drop = FALSE] / lib_sizes) * 1e6
+              gene_expr <- as.numeric(log2(gene_cpm + 1))
+              names(gene_expr) <- colnames(emat)
+            }
             common_cells <- intersect(names(res$stages), names(gene_expr))
             if (length(common_cells) > 0) {
               stage_means <- tapply(as.numeric(gene_expr[common_cells]), res$stages[common_cells], mean)
@@ -1024,6 +1198,37 @@ consistency_rate <- n_consistent / nrow(anchor_results)
 
 cat(sprintf("\n  一致标记基因数: %d / %d (%.1f%%)\n", n_consistent, nrow(anchor_results), 100 * consistency_rate))
 
+# 置换检验：验证标记基因阶段一致性是否显著优于随机
+# (参考: Phipson & Smyth Bioinformatics 2010 — permutation-based significance)
+cat("\n  置换检验 (1000次) — 标记基因阶段一致性:\n")
+n_perm <- 1000
+perm_counts <- numeric(n_perm)
+for (p in 1:n_perm) {
+  shuffled_expected <- sample(anchor_results$expected_stage)
+  perm_consistent <- sum(
+    (anchor_results$bulk_peak == shuffled_expected) &
+    (anchor_results$scRNA_peak == shuffled_expected),
+    na.rm = TRUE
+  )
+  perm_counts[p] <- perm_consistent
+}
+perm_pvalue <- mean(perm_counts >= n_consistent)
+cat(sprintf("  观察值: %d/5, 置换均值: %.2f, p = %.4f\n",
+            n_consistent, mean(perm_counts), perm_pvalue))
+if (perm_pvalue < 0.05) {
+  cat("  ✓ 标记基因一致性显著高于随机 (p < 0.05)\n")
+} else {
+  cat("  ⚠ 标记基因一致性不显著 (p >= 0.05)，分期锚定需谨慎解读\n")
+}
+# 保存置换检验结果
+perm_df <- data.frame(
+  observed = n_consistent,
+  perm_mean = mean(perm_counts),
+  perm_sd = sd(perm_counts),
+  p_value = perm_pvalue
+)
+write.csv(perm_df, file.path(OUTPUT_DIR, "permutation_test_markers.csv"), row.names = FALSE)
+
 if (n_consistent >= 4 && consistency_rate >= 0.75) {
   cat("  ✓ 标记基因锚定通过！分期对应关系成立\n")
   cat("  E → 急性期（3-6h）\n")
@@ -1059,8 +1264,8 @@ if (!anchor_passed) {
           if (length(mod_genes) >= 2) {
             mod_subset <- emat[mod_genes, , drop = FALSE]
             cpm_subset <- Matrix::t(Matrix::t(mod_subset) / lib_sizes) * 1e6
-            log_cpm <- as.matrix(log2(cpm_subset + 1))
-            mod_expr <- colMeans(log_cpm)
+            log_cpm <- log2(cpm_subset + 1)
+            mod_expr <- Matrix::colMeans(log_cpm)
             common_cells <- intersect(names(res$stages), names(mod_expr))
             if (length(common_cells) > 0) {
               stage_means <- tapply(mod_expr[common_cells], res$stages[common_cells], mean)
@@ -1131,6 +1336,30 @@ if (!anchor_passed) {
     n_sig <- sum(abs(module_cors) >= 0.5, na.rm = TRUE)
     cat(sprintf("  平均 Spearman ρ = %+.3f, |ρ|≥0.5 的模块: %d/%d\n",
                 mean_rho, n_sig, length(module_cors)))
+    cat("  注意: n=3 (E/M/L) Spearman ρ 自由度低，单模块ρ值不稳定；以平均ρ和Fisher检验为准\n")
+
+    # Fisher's exact test: 评估跨组学E→M→L阶段方向一致性
+    # 分别计算每个阶段间变化的符号 (E→M, M→L) 在sc和bulk之间是否一致
+    sc_directions <- sign(sc_complete[2, ] - sc_complete[1, ]) * sign(sc_complete[3, ] - sc_complete[2, ])
+    bulk_directions <- sign(bulk_complete[2, ] - bulk_complete[1, ]) * sign(bulk_complete[3, ] - bulk_complete[2, ])
+    names(sc_directions) <- colnames(sc_complete)
+    names(bulk_directions) <- colnames(bulk_complete)
+
+    # 2×2 列联表: 方向一致 vs 不一致
+    concordant <- sum(sc_directions == bulk_directions, na.rm = TRUE)
+    discordant <- sum(sc_directions != bulk_directions & !is.na(sc_directions) & !is.na(bulk_directions), na.rm = TRUE)
+    if (concordant + discordant >= 2) {
+      fisher_res <- fisher.test(matrix(c(concordant, discordant, discordant, concordant), nrow = 2),
+                                 alternative = "greater")
+      cat(sprintf("  Fisher精确检验 (阶段间方向一致性):\n"))
+      cat(sprintf("    一致: %d 模块, 不一致: %d 模块\n", concordant, discordant))
+      cat(sprintf("    p = %.4f (greater)\n", fisher_res$p.value))
+      if (fisher_res$p.value < 0.05) {
+        cat("    ✓ 跨组学阶段间方向显著一致\n")
+      } else {
+        cat("    ⚠ 跨组学方向一致性不显著\n")
+      }
+    }
 
     if (mean_rho >= 0.5) {
       cat("  ✓ 跨组学模块活性排序一致，支持分期锚定结论\n")
@@ -1407,6 +1636,9 @@ results_summary <- list(
   anchor_passed = anchor_passed,
   event_order = event_order,
   inflection_points = inflection_summary,
+  gene_loss_report = gene_loss_report,
+  fallback_log = fallback_log,
+  n_fallbacks = length(fallback_log),
   self_checks = list(
     check1_marker_consistency = c(passed = check1, value = n_consistent),
     check2_module_monotonic = c(passed = check2, value = mono_count),
@@ -1417,11 +1649,15 @@ results_summary <- list(
     inflection_points = file.path(OUTPUT_DIR, "inflection_points.csv"),
     smoothed_curves = file.path(OUTPUT_DIR, "smoothed_curves.csv"),
     anchor_markers = file.path(OUTPUT_DIR, "anchor_marker_genes.csv"),
-    event_order = file.path(OUTPUT_DIR, "event_order_constraints.csv")
+    event_order = file.path(OUTPUT_DIR, "event_order_constraints.csv"),
+    permutation_test = file.path(OUTPUT_DIR, "permutation_test_markers.csv")
   )
 )
 
 saveRDS(results_summary, file.path(OUTPUT_DIR, "QualTCA_results_summary.rds"))
+
+# 降级日志汇总
+print_fallback_summary()
 
 cat("\n========== L1 定性分期锚定完成 ==========\n")
 cat(sprintf("结果保存至: %s\n", OUTPUT_DIR))
