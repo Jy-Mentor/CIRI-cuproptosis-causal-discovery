@@ -68,17 +68,24 @@ def write_sheet(wb, name, df, index=False):
     return ws
 
 # ── Load CSVs ──
+def safe_read(path):
+    try:
+        return pd.read_csv(path)
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        return pd.DataFrame()
+
 csvs = {
-    "AnchorMarkers": pd.read_csv(CSV_DIR / "anchor_marker_genes.csv"),
-    "ModuleTimepoint": pd.read_csv(CSV_DIR / "module_timepoint_summary.csv"),
-    "ssGSEA_Scores": pd.read_csv(CSV_DIR / "ssGSEA_module_scores.csv"),
-    "InflectionPoints": pd.read_csv(CSV_DIR / "inflection_points.csv"),
-    "SmoothedCurves": pd.read_csv(CSV_DIR / "smoothed_curves.csv"),
-    "EventOrder": pd.read_csv(CSV_DIR / "event_order_constraints.csv"),
-    "MCPcounter": pd.read_csv(CSV_DIR / "mcpcounter_cell_scores.csv"),
-    "PermutationTest": pd.read_csv(CSV_DIR / "permutation_test_markers.csv"),
-    "CrossOmics": pd.read_csv(CSV_DIR / "crossomics_spearman.csv"),
-    "CCA": pd.read_csv(CSV_DIR / "cca_results.csv"),
+    "AnchorMarkers": safe_read(CSV_DIR / "anchor_marker_genes.csv"),
+    "ModuleTimepoint": safe_read(CSV_DIR / "module_timepoint_summary.csv"),
+    "ssGSEA_Scores": safe_read(CSV_DIR / "ssGSEA_module_scores.csv"),
+    "InflectionPoints": safe_read(CSV_DIR / "inflection_points.csv"),
+    "SmoothedCurves": safe_read(CSV_DIR / "smoothed_curves.csv"),
+    "EventOrder": safe_read(CSV_DIR / "event_order_constraints.csv"),
+    "MCPcounter": safe_read(CSV_DIR / "mcpcounter_cell_scores.csv"),
+    "PermutationTest": safe_read(CSV_DIR / "permutation_test_markers.csv"),
+    "CrossOmics": safe_read(CSV_DIR / "crossomics_spearman.csv"),
+    "CCA": safe_read(CSV_DIR / "cca_results.csv"),
+    "ObservedPeaks": safe_read(CSV_DIR / "observed_peaks.csv"),
 }
 
 # ── Create workbook ──
@@ -90,16 +97,17 @@ ws_summary.sheet_properties.tabColor = "1F4E79"
 r = 1
 ws_summary.cell(row=r, column=1, value="L1 QualTCA — 定性分期锚定结果汇总").font = TITLE_FONT
 r += 2
-ws_summary.cell(row=r, column=1, value="版本: v9 — MCP-counter 替代 CIBERSORTx").font = SECTION_FONT
+ws_summary.cell(row=r, column=1, value="版本: v11 — 方法学硬伤修复版（置换检验/插值假峰/物种分层/分期修正）").font = SECTION_FONT
 r += 2
 
 # Run info
 info = [
     ("分析名称", "L1 定性分期锚定层 (QualTCA)"),
-    ("运行日期", "2026-05-27 22:58"),
-    ("完成时间", "2026-05-27 23:07"),
+    ("运行日期", "2026-05-28 00:19"),
+    ("完成时间", "2026-05-28 00:30"),
     ("输入数据集", "GSE104036 (小鼠RNA-seq, 3h/6h/12h/24h), GSE97537 (大鼠芯片, 24h), GSE61616 (大鼠芯片, 7d), GSE174574 (小鼠scRNA-seq, 24h)"),
-    ("分析模块", "M1_CopperTransport, M2_FeS_Lipoylation, M3_TCA_PDH, M4_Chaperones, M5_Metallothioneins, M6_StressResponse"),
+    ("分析模块 (CEHG-RNP 3.2)", "M1_CopperTransport, M2_Lipoylation_TCA, M3_FeS_Cluster, M4_OxidativeStress, M5_Energy_Mito, M6_UPR"),
+    ("v11 修复项", "P0-1: 置换检验&→|, P0-2: Spearman退化±1/0警告, P0-3: 删除24h-168h插值假峰, P1-1: 物种分层, P1-2: M1/M5 7d<24h→M期"),
 ]
 for label, val in info:
     ws_summary.cell(row=r, column=1, value=label).font = Font(bold=True, size=11)
@@ -114,7 +122,7 @@ r += 1
 
 checks = [
     ("自检1 — 标记基因跨组学一致性", "≥4/5", "4/5", "✓ 通过"),
-    ("自检2 — 模块活性分期方向一致性", "≥4/6", "6/6", "✓ 通过"),
+    ("自检2 — 模块活性分期方向一致性", "≥4/6", "5/6", "✓ 通过"),
     ("自检3 — MCP-counter 免疫浸润 (E→M/L上升)", "≥2种", "4/4", "✓ 通过"),
 ]
 headers = ["检查项", "阈值", "实际值", "结果"]
@@ -180,16 +188,17 @@ write_sheet(wb, "自检详情", pd.DataFrame({
     "检查项": ["1-标记基因一致性", "2-模块分期方向性", "3-MCP-counter免疫浸润"],
     "描述": ["跨组学(Bulk+scRNA)趋势一致", "模块活性E-vs-L方向正确", "细胞类型评分E→M/L上升"],
     "阈值": ["≥4/5", "≥4/6", "≥2种"],
-    "实际值": ["4/5", "6/6", "4/4"],
+    "实际值": ["4/5", "5/6", "4/4"],
     "结果": ["通过 ✓", "通过 ✓", "通过 ✓"]
 }))
 
 for name in ["AnchorMarkers", "ModuleTimepoint", "ssGSEA_Scores", "InflectionPoints",
-             "SmoothedCurves", "EventOrder", "MCPcounter", "CrossOmics", "CCA"]:
+             "SmoothedCurves", "EventOrder", "ObservedPeaks", "MCPcounter", "CrossOmics", "CCA"]:
     ws = write_sheet(wb, name, csvs[name])
     if name == "AnchorMarkers": ws.sheet_properties.tabColor = "2E75B6"
     elif name == "MCPcounter": ws.sheet_properties.tabColor = "70AD47"
     elif name == "EventOrder": ws.sheet_properties.tabColor = "ED7D31"
+    elif name == "ObservedPeaks": ws.sheet_properties.tabColor = "BF8F00"
 
 write_sheet(wb, "PermutationTest", csvs["PermutationTest"])
 
