@@ -1,26 +1,20 @@
 # ==================== L1 定性分期锚定层（QualTCA）====================
-# 版本: v9 — MCP-counter 替代 CIBERSORTx
+# 版本: v10 — M1-M6 模块按 CEHG-RNP 3.2 标准重写
 # 日期: 2026-05-27
+# v10 变更:
+#   模块定义全面修订为 CEHG-RNP 3.2 标准（GO/KEGG/文献先验基因集）:
+#     M1_CopperTransport:      ATP7A, ATP7B, SLC31A1, STEAP3, STEAP4
+#     M2_Lipoylation_TCA:      FDX1, LIAS, DLAT, DLD, PDHA1, PDHB
+#     M3_FeS_Cluster:          ISCU, NFU1, FXN, BOLA3, GLRX5, HSCB
+#     M4_OxidativeStress:      SOD1, SOD2, GPX4, GSR, CAT, TXN, TXNRD1
+#     M5_Energy_Mito:          MT-CO1, MT-ND1, MT-ND4, MT-ATP6, ATP5A1, NDUFS1
+#     M6_UPR:                  HSPB1, HSPA5, ATF4, DDIT3, XBP1, EIF2AK3
 # v9 变更:
 #   4. CIBERSORTx: 替换为内嵌 MCP-counter (Becht et al. Genome Biology 2016)
-#      无需外部参考矩阵，直接 mean(log2(CPM+1)) 估算免疫浸润分数
 # v8 变更:
 #   1. 标记基因锚定: 单组学匹配替代双组学AND (Bulk||scRNA, 4/5通过)
 #   2. 模块单调性: E-vs-L方向检查替代严格单调 (6/6通过)
-#   3. Monocle3根节点: 多根策略(top 10)替代单根, 改善Neuron/Astrocyte覆盖率
-#
-# 目标：将仅有1d快照的单细胞数据与覆盖3h-7d的Bulk纵向数据建立事件顺序约束
-# 替代不可行的精确伪时间-物理时间映射
-#
-# 输入：
-#   - Bulk表达矩阵：GSE104036（小鼠RNA-seq, 3h/6h/12h/24h）+ GSE97537（大鼠芯片, 24h）+ GSE61616（大鼠芯片, 7d）
-#   - 单细胞表达矩阵：GSE174574（小鼠10X, 24h MCAO vs Sham）
-#
-# 方法：
-#   1. Bulk模块活性动态曲线（ssGSEA + loess拟合 + 拐点提取）
-#   2. 单细胞拟时序与分期（Monocle3 + CytoTRACE）
-#   3. 定性分期锚定（标记基因锚定 + Spearman辅助）
-#   4. MCP-counter 免疫浸润验证（内嵌算法）
+#   3. Monocle3根节点: 多根策略(top 10)替代单根, 改善覆盖率
 # ======================================================================
 
 # ==================== 0. 环境与参数配置 ====================
@@ -93,14 +87,14 @@ FIGURE_DIR  <- file.path(BASE_DIR, "figures/L1_QualTCA")
 dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 dir.create(FIGURE_DIR, showWarnings = FALSE, recursive = TRUE)
 
-# ==================== 铜死亡6模块定义 ====================
+# ==================== CEHG-RNP 3.2 六功能模块定义 ====================
 MODULE_GENES <- list(
-  "M1_CopperTransport" = c("Slc31a1", "Slc31a2", "Atp7a", "Atp7b", "Slc11a2", "Steap3"),
-  "M2_FeS_Lipoylation" = c("Fdx1", "Lias", "Lipt1", "Lipt2", "Gcsh"),
-  "M3_TCA_PDH"          = c("Dld", "Dlat", "Dlst", "Pdha1", "Pdhb", "Dbt"),
-  "M4_Chaperones"       = c("Atox1", "Ccs", "Cox17", "Cox11", "Sco1", "Sco2"),
-  "M5_Metallothioneins" = c("Mt1", "Mt2", "Cp", "Commd1", "Sod1", "Sod3"),
-  "M6_StressResponse"   = c("Mtf1", "Nfe2l2", "Nlrp3", "Gls", "Cdkn2a")
+  "M1_CopperTransport" = c("Slc31a1", "Atp7a", "Atp7b", "Steap3", "Steap4"),
+  "M2_Lipoylation_TCA" = c("Fdx1", "Lias", "Dlat", "Dld", "Pdha1", "Pdhb"),
+  "M3_FeS_Cluster"     = c("Iscu", "Nfu1", "Fxn", "Bola3", "Glrx5", "Hscb"),
+  "M4_OxidativeStress" = c("Sod1", "Sod2", "Gpx4", "Gsr", "Cat", "Txn", "Txnrd1"),
+  "M5_Energy_Mito"     = c("mt-Co1", "mt-Nd1", "mt-Nd4", "mt-Atp6", "Atp5a1", "Ndufs1"),
+  "M6_UPR"             = c("Hspb1", "Hspa5", "Atf4", "Ddit3", "Xbp1", "Eif2ak3")
 )
 
 # ==================== 锚定标记基因 ====================
@@ -126,19 +120,19 @@ cat("独立性检查通过：所有5个标记基因均不属于M1-M6模块\n\n")
 cat("========== 构建大鼠→小鼠同源基因映射表 ==========\n")
 
 rat2mouse_fallback <- data.frame(
-  rat_symbol = c("Mtf1", "Nfe2l2", "Nlrp3", "Gls", "Cdkn2a",
-                  "Fdx1", "Lias", "Lipt1", "Dld", "Dlat", "Dlst",
-                  "Pdha1", "Pdhb", "Dbt", "Gcsh", "Atp7a", "Atp7b",
-                  "Slc31a1", "Slc31a2", "Slc11a2", "Steap3",
-                  "Atox1", "Ccs", "Cox17", "Cox11", "Sco1", "Sco2",
-                  "Mt1", "Mt2", "Cp", "Commd1", "Sod1", "Sod3",
+  rat_symbol = c("Slc31a1", "Atp7a", "Atp7b", "Steap3", "Steap4",
+                  "Fdx1", "Lias", "Dlat", "Dld", "Pdha1", "Pdhb",
+                  "Iscu", "Nfu1", "Fxn", "Bola3", "Glrx5", "Hscb",
+                  "Sod1", "Sod2", "Gpx4", "Gsr", "Cat", "Txn", "Txnrd1",
+                  "mt-Co1", "mt-Nd1", "mt-Nd4", "mt-Atp6", "Atp5a1", "Ndufs1",
+                  "Hspb1", "Hspa5", "Atf4", "Ddit3", "Xbp1", "Eif2ak3",
                   "Tnf", "Il1b", "Hif1a", "Gfap", "Lcn2"),
-  mouse_symbol = c("Mtf1", "Nfe2l2", "Nlrp3", "Gls", "Cdkn2a",
-                    "Fdx1", "Lias", "Lipt1", "Dld", "Dlat", "Dlst",
-                    "Pdha1", "Pdhb", "Dbt", "Gcsh", "Atp7a", "Atp7b",
-                    "Slc31a1", "Slc31a2", "Slc11a2", "Steap3",
-                    "Atox1", "Ccs", "Cox17", "Cox11", "Sco1", "Sco2",
-                    "Mt1", "Mt2", "Cp", "Commd1", "Sod1", "Sod3",
+  mouse_symbol = c("Slc31a1", "Atp7a", "Atp7b", "Steap3", "Steap4",
+                    "Fdx1", "Lias", "Dlat", "Dld", "Pdha1", "Pdhb",
+                    "Iscu", "Nfu1", "Fxn", "Bola3", "Glrx5", "Hscb",
+                    "Sod1", "Sod2", "Gpx4", "Gsr", "Cat", "Txn", "Txnrd1",
+                    "mt-Co1", "mt-Nd1", "mt-Nd4", "mt-Atp6", "Atp5a1", "Ndufs1",
+                    "Hspb1", "Hspa5", "Atf4", "Ddit3", "Xbp1", "Eif2ak3",
                     "Tnf", "Il1b", "Hif1a", "Gfap", "Lcn2"),
   stringsAsFactors = FALSE
 )
@@ -390,18 +384,18 @@ cat(sprintf("  Sham: %d, Model: %d, XST: %d, Unknown: %d\n",
 cat("\n--- 1D. 各数据集独立计算 ssGSEA ---\n")
 
 # 定义各物种的模块基因集
-# 小鼠模块基因（小写首字母）
+# 小鼠模块基因（小写）
 MODULE_GENES_MOUSE <- list(
-  "M1_CopperTransport" = c("Slc31a1", "Slc31a2", "Atp7a", "Atp7b", "Slc11a2", "Steap3"),
-  "M2_FeS_Lipoylation" = c("Fdx1", "Lias", "Lipt1", "Lipt2", "Gcsh"),
-  "M3_TCA_PDH"          = c("Dld", "Dlat", "Dlst", "Pdha1", "Pdhb", "Dbt"),
-  "M4_Chaperones"       = c("Atox1", "Ccs", "Cox17", "Cox11", "Sco1", "Sco2"),
-  "M5_Metallothioneins" = c("Mt1", "Mt2", "Cp", "Commd1", "Sod1", "Sod3"),
-  "M6_StressResponse"   = c("Mtf1", "Nfe2l2", "Nlrp3", "Gls", "Cdkn2a")
+  "M1_CopperTransport" = c("Slc31a1", "Atp7a", "Atp7b", "Steap3", "Steap4"),
+  "M2_Lipoylation_TCA" = c("Fdx1", "Lias", "Dlat", "Dld", "Pdha1", "Pdhb"),
+  "M3_FeS_Cluster"     = c("Iscu", "Nfu1", "Fxn", "Bola3", "Glrx5", "Hscb"),
+  "M4_OxidativeStress" = c("Sod1", "Sod2", "Gpx4", "Gsr", "Cat", "Txn", "Txnrd1"),
+  "M5_Energy_Mito"     = c("mt-Co1", "mt-Nd1", "mt-Nd4", "mt-Atp6", "Atp5a1", "Ndufs1"),
+  "M6_UPR"             = c("Hspb1", "Hspa5", "Atf4", "Ddit3", "Xbp1", "Eif2ak3")
 )
 
-# 大鼠模块基因（大写首字母，与小鼠同）
-MODULE_GENES_RAT <- MODULE_GENES_MOUSE  # 铜死亡基因在大鼠和小鼠中符号一致
+# 大鼠模块基因（符号与小鼠一致，需经 rat2mouse 映射处理）
+MODULE_GENES_RAT <- MODULE_GENES_MOUSE
 
 compute_ssgsea_per_dataset <- function(expr_matrix, gene_sets, dataset_name, timepoint_val, batch_val) {
   gs_filtered <- lapply(gene_sets, function(gs) intersect(gs, rownames(expr_matrix)))
