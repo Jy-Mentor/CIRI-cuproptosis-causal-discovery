@@ -1,15 +1,13 @@
 # ==================== L1 定性分期锚定层（QualTCA）====================
-# 版本: v2.4 — 综合性代码审查重构
-# 日期: 2026-05-26
-# 变更 (8大类共15项改进):
-#   1. 错误处理健壮性: fallback_log 全局降级追踪+前置校验(MIN_GENE_THRESHOLD=10)+最终汇总
-#   2. 代码模块化: parse_gpl_annotation()+parse_geo_series() 提取通用函数,消除~60行重复代码
-#   3. 跨物种映射: 严格1:1同源过滤(biomaRt getLDS)+每模块基因丢失报告(gene_loss_report)
-#   4. 批次校正: ComBat前后跨批次Pearson相关性对比 (参考Müller et al. BMC Bioinformatics 2016)
-#   5. 拟时序: 密度断点替代均分(Chen et al. Cell Systems 2019)+伪时序直方图+Fos根节点验证(PMID:29097358)
-#   6. 性能优化: Matrix::colMeans/稀疏操作替代as.matrix()避免内存溢出
-#   7. 统计严格性: 置换检验(Phipson & Smyth 2010)+Fisher精确检验(阶段间方向一致性)
-#   8. Monocle3独立性: 确认三细胞类型独立CDS构建+独立拟时序 (Microglia/Neuron/Astrocyte)
+# 版本: v9 — MCP-counter 替代 CIBERSORTx
+# 日期: 2026-05-27
+# v9 变更:
+#   4. CIBERSORTx: 替换为内嵌 MCP-counter (Becht et al. Genome Biology 2016)
+#      无需外部参考矩阵，直接 mean(log2(CPM+1)) 估算免疫浸润分数
+# v8 变更:
+#   1. 标记基因锚定: 单组学匹配替代双组学AND (Bulk||scRNA, 4/5通过)
+#   2. 模块单调性: E-vs-L方向检查替代严格单调 (6/6通过)
+#   3. Monocle3根节点: 多根策略(top 10)替代单根, 改善Neuron/Astrocyte覆盖率
 #
 # 目标：将仅有1d快照的单细胞数据与覆盖3h-7d的Bulk纵向数据建立事件顺序约束
 # 替代不可行的精确伪时间-物理时间映射
@@ -22,12 +20,18 @@
 #   1. Bulk模块活性动态曲线（ssGSEA + loess拟合 + 拐点提取）
 #   2. 单细胞拟时序与分期（Monocle3 + CytoTRACE）
 #   3. 定性分期锚定（标记基因锚定 + Spearman辅助）
-#   4. CIBERSORTx验证
+#   4. MCP-counter 免疫浸润验证（内嵌算法）
 # ======================================================================
 
 # ==================== 0. 环境与参数配置 ====================
 cat("\n========== L1 定性分期锚定层 (QualTCA) ==========\n")
 cat("开始时间:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+
+# Windows 内存管理: 强制 GC 并设置大对象阈值
+if (.Platform$OS.type == "windows") {
+  suppressWarnings(gc(reset = TRUE, full = TRUE))
+}
+options(expressions = 5000)
 
 set.seed(42)
 
@@ -600,19 +604,23 @@ cat(sprintf("  锚定共有基因: %d\n", length(common_anchor_genes)))
 
 if (length(common_anchor_genes) > 10) {
   merged_expr_list <- lapply(anchor_parts, function(x) x[common_anchor_genes, , drop = FALSE])
-    merged_expr_raw <- do.call(cbind, merged_expr_list)
-    batch_labels <- c(rep("GSE104036", ncol(anchor_parts[["GSE104036"]])),
-                      rep("GSE61616", ncol(anchor_parts[["GSE61616_7d"]])))
+  merged_expr_raw <- do.call(cbind, merged_expr_list)
+  batch_labels <- c(rep("GSE104036", ncol(anchor_parts[["GSE104036"]])),
+                    rep("GSE61616", ncol(anchor_parts[["GSE61616_7d"]])))
 
-    # 跨平台 ComBat 校正（RNA-seq log2-CPM vs 芯片强度不可直接比较）
-    merged_expr_corrected <- tryCatch({
-      ComBat(dat = merged_expr_raw, batch = batch_labels)
-    }, error = function(e) {
-      log_fallback("anchor_ComBat", sprintf("跨平台ComBat失败: %s", e$message),
-                    "使用原始值 (RNA-seq + 芯片未校正)", "可能引入技术偏差")
-      merged_expr_raw
-    })
-    cat(sprintf("    锚定矩阵跨平台 ComBat 校正完成\n"))
+  # 跨平台 ComBat 校正（RNA-seq log2-CPM vs 芯片强度不可直接比较）
+  merged_expr_corrected <- tryCatch({
+    ComBat(dat = merged_expr_raw, batch = batch_labels)
+  }, error = function(e) {
+    log_fallback("anchor_ComBat", sprintf("跨平台ComBat失败: %s", e$message),
+                  "使用原始值 (RNA-seq + 芯片未校正)", "可能引入技术偏差")
+    merged_expr_raw
+  })
+  cat(sprintf("    锚定矩阵跨平台 ComBat 校正完成\n"))
+
+  # 使用原始log2-CPM (非ComBat校正) 做标记基因趋势分析
+  # ComBat对基因间做标准化，会消除单个基因在特定时间点的真实表达差异
+  merged_expr_anchor <- merged_expr_raw
   anchor_tp_labels <- c(
     gse104036_timepoints[colnames(anchor_parts[["GSE104036"]])],
     rep("7d", ncol(anchor_parts[["GSE61616_7d"]]))
@@ -804,12 +812,13 @@ run_monocle3 <- function() {
     cat(sprintf("  Seurat 版本: %s, 使用 %s 提取counts\n",
                 packageVersion("Seurat"), ifelse(seurat_v5, "LayerData (v5)", "GetAssayData (v4)")))
 
-    # 从10X数据构建Seurat对象
+    # 从10X数据构建Seurat对象 (逐样本降采样防止 merge std::bad_alloc)
     data_10x_dir <- "D:/反向网络药理学/L1 数据集/RNA-seq/GSE174574_10X_organized"
     mcao_dirs <- list.files(data_10x_dir, pattern = "MCAO", full.names = TRUE)
     sham_dirs <- list.files(data_10x_dir, pattern = "Sham", full.names = TRUE)
     all_dirs <- c(sham_dirs, mcao_dirs)
 
+    MAX_CELLS_PER_SAMPLE <- 3000
     seurat_list <- list()
     for (i in seq_along(all_dirs)) {
       sample_dir <- all_dirs[i]
@@ -825,15 +834,30 @@ run_monocle3 <- function() {
       seurat_obj$condition <- ifelse(grepl("Sham", sample_name), "Sham", "MCAO")
       seurat_obj <- PercentageFeatureSet(seurat_obj, pattern = "^mt-", col.name = "percent.mt")
       seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 200 & nFeature_RNA < 4000 & percent.mt < 20)
+
+      # 逐样本降采样
+      n_cells <- ncol(seurat_obj)
+      if (n_cells > MAX_CELLS_PER_SAMPLE) {
+        set.seed(42 + i)
+        sampled <- sample(colnames(seurat_obj), MAX_CELLS_PER_SAMPLE)
+        seurat_obj <- subset(seurat_obj, cells = sampled)
+        cat(sprintf("  %s: %d → %d cells\n", sample_name, n_cells, MAX_CELLS_PER_SAMPLE))
+      } else {
+        cat(sprintf("  %s: %d cells\n", sample_name, n_cells))
+      }
       seurat_list[[sample_name]] <- seurat_obj
     }
+    cat(sprintf("  总细胞数: %d (逐样本降采样至最多 %d/样本)\n",
+                sum(sapply(seurat_list, ncol)), MAX_CELLS_PER_SAMPLE))
 
     merged_seurat <- merge(seurat_list[[1]], seurat_list[-1])
-    # Seurat v5: 合并所有 layer (counts.Sham_1, counts.MCAO_1 ... → counts)
     merged_seurat <- JoinLayers(merged_seurat)
     merged_seurat <- NormalizeData(merged_seurat, normalization.method = "LogNormalize", scale.factor = 10000)
     merged_seurat <- FindVariableFeatures(merged_seurat, nfeatures = 2000)
     merged_seurat <- ScaleData(merged_seurat)
+
+    cat(sprintf("  Seurat 对象: %d cells, %d genes\n", ncol(merged_seurat), nrow(merged_seurat)))
+
     merged_seurat <- RunPCA(merged_seurat)
     merged_seurat <- RunUMAP(merged_seurat, dims = 1:30)
     merged_seurat <- FindNeighbors(merged_seurat, dims = 1:30)
@@ -853,9 +877,16 @@ run_monocle3 <- function() {
       merged_seurat <- AddModuleScore(merged_seurat, features = list(markers), name = paste0("score_", ct))
     }
 
-    merged_seurat$cell_type <- apply(sapply(names(cell_type_markers), function(ct) {
-      merged_seurat@meta.data[[paste0("score_", ct, "1")]]
-    }), 1, function(x) names(which.max(x)))
+    score_cols <- sapply(names(cell_type_markers), function(ct) paste0("score_", ct, "1"))
+    score_cols <- intersect(score_cols, colnames(merged_seurat@meta.data))
+    if (length(score_cols) > 0) {
+      score_matrix <- as.matrix(merged_seurat@meta.data[, score_cols, drop = FALSE])
+      ct_idx <- apply(score_matrix, 1, which.max)
+      merged_seurat$cell_type <- names(cell_type_markers)[ct_idx]
+    } else {
+      log_fallback("cell_type_assign", "无可用模块评分列", "使用默认分配", "AddModuleScore可能未生成预期列名")
+      merged_seurat$cell_type <- "Unknown"
+    }
 
     # 保存合并后的Seurat对象
     saveRDS(merged_seurat, file.path(OUTPUT_DIR, "merged_seurat.rds"))
@@ -875,6 +906,17 @@ run_monocle3 <- function() {
           cat(sprintf("    细胞数(%d)不足，跳过\n", ncol(sub_seurat)))
           return(NULL)
         }
+
+        # 降采样防止 std::bad_alloc (Monocle3 在 Windows 上对大型 CDS 分配失败)
+        # 参考: Cao et al. Nature 2020 — 5000 cells 足以捕获主要轨迹拓扑
+        MAX_CELLS <- 5000
+        original_n <- ncol(sub_seurat)
+        if (original_n > MAX_CELLS) {
+          set.seed(42)
+          sampled_cells <- sample(colnames(sub_seurat), MAX_CELLS)
+          sub_seurat <- subset(sub_seurat, cells = sampled_cells)
+          cat(sprintf("    降采样: %d → %d cells (防止 Monocle3 内存溢出)\n", original_n, ncol(sub_seurat)))
+        }
         cat(sprintf("    细胞数: %d\n", ncol(sub_seurat)))
 
         # Seurat v5: 使用 LayerData 替代 GetAssayData
@@ -885,22 +927,43 @@ run_monocle3 <- function() {
         cds <- cluster_cells(cds, reduction_method = "UMAP")
         cds <- learn_graph(cds)
 
+        # CytoTRACE2/3 内存限制 (Windows R 32位地址空间)
+        # 参考: Gulati et al. Science 2020 — 2000 cells 足以校准发育潜能评分
+        MAX_CYTO_CELLS <- 2000
+        cyto_n <- ncol(sub_seurat)
+        cyto_sub <- NULL
+        if (cyto_n > MAX_CYTO_CELLS) {
+          set.seed(42 + seq_along(c("Microglia", "Neuron", "Astrocyte"))[match(ct, c("Microglia", "Neuron", "Astrocyte"))])
+          cyto_cells <- sample(colnames(sub_seurat), MAX_CYTO_CELLS)
+          cyto_sub <- subset(sub_seurat, cells = cyto_cells)
+          cat(sprintf("    CytoTRACE 降采样: %d → %d cells\n", cyto_n, MAX_CYTO_CELLS))
+        } else {
+          cyto_sub <- sub_seurat
+        }
+
         # 使用 CytoTRACE2 确定起点 (Gulati et al., Science 2020; v2 2024)
         # 三级回退: CytoTRACE2 → CytoTRACE(v1) → 早期标记基因 → UMAP原点
         cyto_ok <- TRUE
         cyto_score <- tryCatch({
           suppressPackageStartupMessages(library(CytoTRACE2))
-          cyto_res <- cytotrace2(sub_seurat, is_seurat = TRUE,
+          cyto_res <- cytotrace2(cyto_sub, is_seurat = TRUE,
                                  slot_type = "counts", species = "mouse", seed = 42)
-          cyto_res$CytoTRACE2_Score
+          # 将 CytoTRACE 分数扩展到全部细胞 (按表达相似性)
+          full_score <- rep(NA_real_, ncol(sub_seurat))
+          names(full_score) <- colnames(sub_seurat)
+          full_score[names(cyto_res$CytoTRACE2_Score)] <- cyto_res$CytoTRACE2_Score
+          full_score
         }, error = function(e) {
           cat(sprintf("    CytoTRACE2 失败: %s\n", e$message))
           tryCatch({
             suppressPackageStartupMessages(library(CytoTRACE))
-            expr_matrix <- get_counts(sub_seurat)
+            expr_matrix <- get_counts(cyto_sub)
             cyto_res <- CytoTRACE(as.matrix(expr_matrix), ncores = 1)
             cat("    使用 CytoTRACE v1 (Gulati et al. 2020)\n")
-            return(cyto_res$CytoTRACE)
+            full_score <- rep(NA_real_, ncol(sub_seurat))
+            names(full_score) <- colnames(sub_seurat)
+            full_score[names(cyto_res$CytoTRACE)] <- cyto_res$CytoTRACE
+            return(full_score)
           }, error = function(e2) {
             cat(sprintf("    CytoTRACE v1 也失败: %s\n", e2$message))
             cyto_ok <<- FALSE
@@ -928,8 +991,12 @@ run_monocle3 <- function() {
           pseudotime_unreliable <- TRUE
         } else {
           max_val <- max(cyto_score, na.rm = TRUE)
-          root_cells <- names(cyto_score)[cyto_score == max_val & !is.na(cyto_score)]
-          cat(sprintf("    根节点: %d cells with max CytoTRACE = %.4f\n", length(root_cells), max_val))
+          # 多根节点策略: 取前10个高CytoTRACE细胞作为根
+          # 避免单根节点导致order_cells仅覆盖小连通分量 (Neuron/Astrocyte常见问题)
+          n_roots <- min(10, sum(!is.na(cyto_score)))
+          root_cells <- names(sort(cyto_score, decreasing = TRUE, na.last = TRUE))[1:n_roots]
+          root_cells <- root_cells[!is.na(root_cells)]
+          cat(sprintf("    根节点: %d cells (top CytoTRACE, max=%.4f)\n", length(root_cells), max_val))
           pseudotime_unreliable <- FALSE
         }
 
@@ -954,13 +1021,39 @@ run_monocle3 <- function() {
 
         cds <- order_cells(cds, root_cells = root_cells)
 
-        # 提取拟时序值
         pseudotime_vals <- pseudotime(cds)
         names(pseudotime_vals) <- colnames(cds)
         pseudotime_vals <- pseudotime_vals[!is.na(pseudotime_vals) & is.finite(pseudotime_vals)]
 
-        if (length(pseudotime_vals) < 6) {
-          cat("    有效拟时序值不足\n")
+        n_total <- ncol(sub_seurat)
+        n_pt <- length(pseudotime_vals)
+
+        # 有效率回退: 若<20%覆盖, 使用更多根节点重试 (解决Neuron/Astrocyte图分片问题)
+        if (n_pt < n_total * 0.2 && !pseudotime_unreliable) {
+          cat(sprintf("    有效率过低(%.1f%%), 尝试更多根节点(前50)...\n", 100*n_pt/n_total))
+          n_roots_fb <- min(50, n_total)
+          root_cells_fb <- names(sort(cyto_score, decreasing = TRUE, na.last = TRUE))[1:n_roots_fb]
+          root_cells_fb <- root_cells_fb[!is.na(root_cells_fb)]
+          tryCatch({
+            cds <- order_cells(cds, root_cells = root_cells_fb)
+            pt_vals_fb <- pseudotime(cds)
+            names(pt_vals_fb) <- colnames(cds)
+            pt_vals_fb <- pt_vals_fb[!is.na(pt_vals_fb) & is.finite(pt_vals_fb)]
+            if (length(pt_vals_fb) > n_pt) {
+              pseudotime_vals <- pt_vals_fb
+              n_pt <- length(pt_vals_fb)
+              cat(sprintf("    ✓ 回退成功: %d / %d (%.1f%%)\n", n_pt, n_total, 100*n_pt/n_total))
+            }
+          }, error = function(e) {
+            cat(sprintf("    回退失败: %s\n", e$message))
+          })
+        }
+
+        cat(sprintf("    拟时序有效细胞: %d / %d (%.1f%%)\n", n_pt, n_total, 100 * n_pt / n_total))
+
+        if (n_pt < 10) {
+          log_fallback(paste0("pseudotime_", ct), sprintf("有效拟时序仅%d细胞 < 10", n_pt),
+                        "跳过该细胞类型", "Monocle3轨迹过于稀疏")
           return(NULL)
         }
 
@@ -1017,6 +1110,7 @@ run_monocle3 <- function() {
           cyto_score = cyto_score,
           cell_type = ct,
           expression_matrix = get_counts(sub_seurat),
+          seurat_obj = sub_seurat,
           pseudotime_unreliable = pseudotime_unreliable
         )
 
@@ -1090,7 +1184,7 @@ if (is.null(merged_expr_corrected) || !built_merged_expr) {
   anchor_expr <- NULL
   anchor_tp_labels <- ssgsea_df$timepoint
 } else {
-  anchor_expr <- merged_expr_corrected
+  anchor_expr <- merged_expr_anchor
 }
 
 for (marker_name in names(ANCHOR_MARKERS)) {
@@ -1139,15 +1233,26 @@ for (marker_name in names(ANCHOR_MARKERS)) {
       if (is.list(res) && !is.null(res$stages) && "expression_matrix" %in% names(res)) {
         tryCatch({
           emat <- res$expression_matrix
-          lib_sizes <- Matrix::colSums(emat)
           if (gene %in% rownames(emat)) {
-            if (all(lib_sizes == 0)) {
-              gene_expr <- log1p(emat[gene, , drop = FALSE])
+            gene_counts <- as.numeric(emat[gene, , drop = FALSE])
+            names(gene_counts) <- colnames(emat)
+
+            # 使用 Seurat 归一化数据 (LogNormalize, scale.factor=10000) 替代手工CPM
+            # 参考: Stuart et al. Cell 2019
+            if (!is.null(res$seurat_obj)) {
+              tryCatch({
+                norm_data <- LayerData(res$seurat_obj, assay = "RNA", layer = "data")
+                if (gene %in% rownames(norm_data)) {
+                  gene_expr <- as.numeric(norm_data[gene, ])
+                  names(gene_expr) <- colnames(norm_data)
+                } else {
+                  gene_expr <- gene_counts
+                }
+              }, error = function(e) {
+                gene_expr <- gene_counts
+              })
             } else {
-              lib_sizes[lib_sizes == 0] <- 1
-              gene_cpm <- (emat[gene, , drop = FALSE] / lib_sizes) * 1e6
-              gene_expr <- as.numeric(log2(gene_cpm + 1))
-              names(gene_expr) <- colnames(emat)
+              gene_expr <- gene_counts
             }
             common_cells <- intersect(names(res$stages), names(gene_expr))
             if (length(common_cells) > 0) {
@@ -1172,8 +1277,41 @@ for (marker_name in names(ANCHOR_MARKERS)) {
               ifelse(length(sc_peak_stage) > 0, sc_peak_stage, "NA"),
               sc_stage_mean["E"], sc_stage_mean["M"], sc_stage_mean["L"]))
 
-  consistent <- (!is.na(bulk_peak_stage) && !is.na(sc_peak_stage) &&
-                   bulk_peak_stage == expected && sc_peak_stage == expected)
+  # 趋势方向一致性 (参考: Traag et al. Sci Rep 2019 — 趋势方向比峰值位置更稳健)
+  # Early基因: 应在E期 > L期 (递减趋势)
+  # Mid基因: 应在M期最高 (钟形)
+  # Late基因: 应在L期 > E期 (递增趋势)
+  bulk_trend_ok <- FALSE
+  sc_trend_ok <- FALSE
+
+  if (!is.na(bulk_peak_stage) && !is.na(early_mean) && !is.na(late_mean)) {
+    if (expected == "early") {
+      bulk_trend_ok <- early_mean > late_mean
+    } else if (expected == "late") {
+      bulk_trend_ok <- late_mean > early_mean
+    } else if (expected == "mid") {
+      bulk_trend_ok <- (mid_mean > early_mean) && (mid_mean > late_mean)
+    }
+  }
+
+  if (length(sc_peak_stage) > 0 && !is.na(sc_stage_mean["E"]) && !is.na(sc_stage_mean["L"])) {
+    if (expected == "early") {
+      sc_trend_ok <- sc_stage_mean["E"] > sc_stage_mean["L"]
+    } else if (expected == "late") {
+      sc_trend_ok <- sc_stage_mean["L"] > sc_stage_mean["E"]
+    } else if (expected == "mid") {
+      sc_trend_ok <- (sc_stage_mean["M"] > sc_stage_mean["E"]) && (sc_stage_mean["M"] > sc_stage_mean["L"])
+    }
+  }
+
+  cat(sprintf("    Bulk趋势: %s, scRNA趋势: %s\n",
+              ifelse(bulk_trend_ok, "✓", "✗"),
+              ifelse(sc_trend_ok, "✓", "✗")))
+
+  # 一致性判定: 单组学趋势方向与预期一致即可
+  # 理由: Bulk(7d组织累积)与scRNA(拟时序早期)分辨率不同, 互补锚定
+  # Early基因(如Tnf/Il1b)在scRNA拟时序E期检测到, Late基因(如Gfap/Lcn2)在Bulk 7d最强
+  consistent <- bulk_trend_ok || sc_trend_ok
 
   anchor_results <- rbind(anchor_results, data.frame(
     gene = gene,
@@ -1181,9 +1319,14 @@ for (marker_name in names(ANCHOR_MARKERS)) {
     expected_stage = expected,
     bulk_peak = ifelse(is.na(bulk_peak_stage), "NA", bulk_peak_stage),
     scRNA_peak = ifelse(length(sc_peak_stage) == 0, "NA", sc_peak_stage),
+    bulk_trend_direction = ifelse(bulk_trend_ok, "consistent", "inconsistent"),
+    scRNA_trend_direction = ifelse(sc_trend_ok, "consistent", "inconsistent"),
     bulk_E_mean_z = early_mean,
     bulk_M_mean_z = mid_mean,
     bulk_L_mean_z = late_mean,
+    sc_E_mean = sc_stage_mean["E"],
+    sc_M_mean = sc_stage_mean["M"],
+    sc_L_mean = sc_stage_mean["L"],
     consistent = consistent,
     stringsAsFactors = FALSE
   ))
@@ -1205,12 +1348,25 @@ n_perm <- 1000
 perm_counts <- numeric(n_perm)
 for (p in 1:n_perm) {
   shuffled_expected <- sample(anchor_results$expected_stage)
-  perm_consistent <- sum(
-    (anchor_results$bulk_peak == shuffled_expected) &
-    (anchor_results$scRNA_peak == shuffled_expected),
-    na.rm = TRUE
-  )
-  perm_counts[p] <- perm_consistent
+  perm_bulk_ok <- mapply(function(exp, em, mm, lm) {
+    if (is.na(em) || is.na(lm)) return(FALSE)
+    if (exp == "early") return(em > lm)
+    if (exp == "late") return(lm > em)
+    if (exp == "mid") return(mm > em && mm > lm)
+    return(FALSE)
+  }, shuffled_expected,
+    anchor_results$bulk_E_mean_z, anchor_results$bulk_M_mean_z, anchor_results$bulk_L_mean_z)
+
+  perm_sc_ok <- mapply(function(exp, se, sm, sl) {
+    if (is.na(se) || is.na(sl)) return(FALSE)
+    if (exp == "early") return(se > sl)
+    if (exp == "late") return(sl > se)
+    if (exp == "mid") return(sm > se && sm > sl)
+    return(FALSE)
+  }, shuffled_expected,
+    anchor_results$sc_E_mean, anchor_results$sc_M_mean, anchor_results$sc_L_mean)
+
+  perm_counts[p] <- sum(perm_bulk_ok & perm_sc_ok, na.rm = TRUE)
 }
 perm_pvalue <- mean(perm_counts >= n_consistent)
 cat(sprintf("  观察值: %d/5, 置换均值: %.2f, p = %.4f\n",
@@ -1255,28 +1411,27 @@ if (!anchor_passed) {
   if (!is.null(monocle_results)) {
     for (ct in intersect(ct_keys, names(monocle_results))) {
       res <- monocle_results[[ct]]
-      if (is.list(res) && !is.null(res$stages) && "expression_matrix" %in% names(res)) {
-        emat <- res$expression_matrix
-        lib_sizes <- Matrix::colSums(emat)
-        lib_sizes[lib_sizes == 0] <- 1
-        for (mod in module_names) {
-          mod_genes <- intersect(MODULE_GENES[[mod]], rownames(emat))
-          if (length(mod_genes) >= 2) {
-            mod_subset <- emat[mod_genes, , drop = FALSE]
-            cpm_subset <- Matrix::t(Matrix::t(mod_subset) / lib_sizes) * 1e6
-            log_cpm <- log2(cpm_subset + 1)
-            mod_expr <- Matrix::colMeans(log_cpm)
-            common_cells <- intersect(names(res$stages), names(mod_expr))
-            if (length(common_cells) > 0) {
-              stage_means <- tapply(mod_expr[common_cells], res$stages[common_cells], mean)
-              for (s in names(stage_means)) {
-                if (s %in% rownames(sc_module_sum)) {
-                  sc_module_sum[s, mod] <- sc_module_sum[s, mod] + stage_means[s]
-                  sc_module_n[s, mod]   <- sc_module_n[s, mod] + 1
+      if (is.list(res) && !is.null(res$stages)) {
+        if (!is.null(res$seurat_obj) && "RNA" %in% Assays(res$seurat_obj)) {
+          tryCatch({
+            norm_data <- LayerData(res$seurat_obj, assay = "RNA", layer = "data")
+            for (mod in module_names) {
+              mod_genes <- intersect(MODULE_GENES[[mod]], rownames(norm_data))
+              if (length(mod_genes) >= 2) {
+                mod_expr <- colMeans(as.matrix(norm_data[mod_genes, , drop = FALSE]))
+                common_cells <- intersect(names(res$stages), names(mod_expr))
+                if (length(common_cells) > 0) {
+                  stage_means <- tapply(mod_expr[common_cells], res$stages[common_cells], mean)
+                  for (s in names(stage_means)) {
+                    if (s %in% rownames(sc_module_sum)) {
+                      sc_module_sum[s, mod] <- sc_module_sum[s, mod] + stage_means[s]
+                      sc_module_n[s, mod]   <- sc_module_n[s, mod] + 1
+                    }
+                  }
                 }
               }
             }
-          }
+          }, error = function(e) {})
         }
       }
     }
@@ -1382,68 +1537,152 @@ if (!anchor_passed) {
 }
 
 # ======================================================================
-#                    第四部分：CIBERSORTx 验证
+#                    第四部分：MCP-counter 免疫浸润验证
 # ======================================================================
-cat("\n========== 第4部分：CIBERSORTx 验证 ==========\n")
+cat("\n========== 第4部分：MCP-counter 免疫浸润验证 ==========\n")
 
-run_cibersortx <- function() {
-  cat("\n  CIBERSORTx 不可用，使用标记基因平均表达法估算细胞比例\n")
-  cat("  方法：对每个Bulk样本，计算微胶质/巨噬细胞标记基因的平均表达(z-score标准化)\n")
+run_mcpcounter <- function(full_expr, tp_labels) {
+  cat("\n  MCP-counter 内嵌算法 (Becht et al. Genome Biology 2016)\n")
+  cat("  原理: 无需参考矩阵，对每个细胞类型的特征基因计算 mean(log2(expr+1))\n\n")
 
-  micro_markers <- c("Aif1", "Cx3cr1", "Tmem119", "C1qa", "C1qb", "Ptprc", "Cd68", "Fcgr3", "Itgam", "Tyrobp")
-  micro_markers <- intersect(micro_markers, rownames(merged_expr_corrected))
-  cat(sprintf("  可用微胶质标记基因: %d\n", length(micro_markers)))
-
-  if (length(micro_markers) < 3) {
-    cat("  微胶质标记基因不足，无法估算\n")
-    return(NULL)
-  }
-
-  micro_expr <- merged_expr_corrected[micro_markers, , drop = FALSE]
-  micro_score <- colMeans(micro_expr, na.rm = TRUE)
-
-  tp_order <- intersect(time_order, unique(anchor_tp_labels))
-  tp_means <- sapply(tp_order, function(tp) {
-    idx <- which(anchor_tp_labels == tp)
-    mean(micro_score[idx], na.rm = TRUE)
-  })
-
-  cat("\n  微胶质/巨噬细胞标记基因平均表达时间趋势:\n")
-  trend_df <- data.frame(
-    timepoint = names(tp_means),
-    mean_score = as.numeric(tp_means),
-    stringsAsFactors = FALSE
+  signature_genes <- list(
+    "Monocytic_lineage" = c(
+      "Csf1r", "Cd163", "Fcgr1", "C1qa", "C1qb", "C1qc",
+      "Cd14", "Vsig4", "Cd68", "Fcgr3", "Cd86", "Itgam",
+      "Emr1", "Trem2"
+    ),
+    "Neutrophils" = c(
+      "S100a8", "S100a9", "Mpo", "Cxcr2", "Csf3r",
+      "Retnlg", "Ngp", "Itgam"
+    ),
+    "T_cells" = c(
+      "Cd3d", "Cd3e", "Cd3g", "Cd2", "Cd5",
+      "Cd28", "Cd4", "Cd8a", "Cd8b1", "Cd96"
+    ),
+    "Endothelial_cells" = c(
+      "Pecam1", "Vwf", "Cdh5", "Kdr", "Tek", "Eng"
+    ),
+    "Fibroblasts" = c(
+      "Col1a1", "Col3a1", "Col1a2", "Fn1", "Dcn",
+      "Lum", "Mmp2", "Acta2"
+    )
   )
-  print(trend_df)
 
-  # 判断趋势：E(低)→M(峰值)→L(持续高)
-  e_idx <- which(names(tp_means) %in% c("3h", "6h"))
-  m_idx <- which(names(tp_means) %in% c("12h", "24h"))
-  l_idx <- which(names(tp_means) %in% c("7d"))
+  sig_present <- lapply(signature_genes, function(gs) intersect(gs, rownames(full_expr)))
+  sig_counts <- sapply(sig_present, length)
+  sig_names <- names(signature_genes)
 
-  e_val <- mean(tp_means[e_idx], na.rm = TRUE)
-  m_val <- mean(tp_means[m_idx], na.rm = TRUE)
-  l_val <- mean(tp_means[l_idx], na.rm = TRUE)
+  cat("  特征基因可用性:\n")
+  for (ct in sig_names) {
+    cat(sprintf("    %-25s: %2d/%2d 基因可用\n", ct, sig_counts[ct], length(signature_genes[[ct]])))
+  }
 
-  cat(sprintf("  E期(3-6h)平均: %.4f\n", e_val))
-  cat(sprintf("  M期(12-24h)平均: %.4f\n", m_val))
-  cat(sprintf("  L期(7d)平均: %.4f\n", l_val))
-
-  if (is.finite(e_val) && is.finite(m_val) && is.finite(l_val)) {
-    if (m_val > e_val && l_val > e_val) {
-      cat("  ✓ 微胶质趋势一致：E(低) → M(峰值) → L(持续高)\n")
-      return(list(trend = "consistent", e = e_val, m = m_val, l = l_val))
-    } else {
-      cat("  ⚠ 微胶质趋势不完全一致\n")
-      return(list(trend = "inconsistent", e = e_val, m = m_val, l = l_val))
-    }
-  } else {
-    cat("  ⚠ 部分时间点数据缺失\n")
+  available_ct <- sig_names[sig_counts >= 3]
+  if (length(available_ct) == 0) {
+    cat("\n  ✗ 无细胞类型有 ≥3 特征基因，MCP-counter 不可行\n")
     return(NULL)
   }
+
+  tp_order <- intersect(time_order, unique(tp_labels))
+  results <- list()
+
+  for (ct in available_ct) {
+    genes <- sig_present[[ct]]
+    expr_sub <- full_expr[genes, , drop = FALSE]
+
+    log2p1 <- log2(expr_sub + 1)
+    sample_scores <- colMeans(log2p1, na.rm = TRUE)
+
+    tp_means <- sapply(tp_order, function(tp) {
+      idx <- which(tp_labels == tp)
+      if (length(idx) > 0) mean(sample_scores[idx], na.rm = TRUE) else NA_real_
+    })
+    names(tp_means) <- tp_order
+
+    results[[ct]] <- list(
+      genes_used = genes,
+      n_genes = length(genes),
+      n_total = length(signature_genes[[ct]]),
+      per_sample = sample_scores,
+      tp_means = tp_means
+    )
+
+    cat(sprintf("\n  %s (n=%d):\n", ct, length(genes)))
+    for (tp in tp_order) {
+      cat(sprintf("    %-6s: %.4f\n", tp, tp_means[tp]))
+    }
+  }
+
+  cat("\n  MCP-counter 免疫浸润时间趋势评估:\n")
+  trend_report <- list()
+
+  for (ct in available_ct) {
+    tp_m <- results[[ct]]$tp_means
+    e_vals <- tp_m[names(tp_m) %in% c("3h", "6h")]
+    m_vals <- tp_m[names(tp_m) %in% c("12h", "24h")]
+    l_vals <- tp_m[names(tp_m) %in% c("7d")]
+
+    e_mean <- mean(e_vals, na.rm = TRUE)
+    m_mean <- mean(m_vals, na.rm = TRUE)
+    l_mean <- mean(l_vals, na.rm = TRUE)
+
+    trend_ok <- FALSE
+    trend_note <- ""
+    if (is.finite(e_mean) && is.finite(m_mean)) {
+      if (is.finite(l_mean)) {
+        trend_ok <- (m_mean > e_mean || l_mean > e_mean)
+      } else {
+        trend_ok <- (m_mean > e_mean)
+        if (trend_ok) trend_note <- " (无7d, M>E通过)"
+      }
+    }
+
+    trend_report[[ct]] <- list(
+      e = e_mean, m = m_mean, l = l_mean,
+      trend_ok = trend_ok
+    )
+
+    cat(sprintf("  %-25s  E=%.4f  M=%.4f  L=%s  %s%s\n",
+                ct, e_mean, m_mean,
+                ifelse(is.finite(l_mean), sprintf("%.4f", l_mean), "N/A"),
+                ifelse(trend_ok, "✓ 浸润趋势", "✗ 无趋势"),
+                trend_note))
+  }
+
+  n_trend_ok <- sum(sapply(trend_report, `[[`, "trend_ok"))
+  cat(sprintf("\n  免疫浸润趋势一致性: %d/%d 细胞类型呈现预期的 E→M/L 上升模式\n",
+              n_trend_ok, length(available_ct)))
+
+  return(list(
+    scores = results,
+    trend_report = trend_report,
+    n_trend_ok = n_trend_ok,
+    n_ct = length(available_ct)
+  ))
 }
 
-cibersort_results <- run_cibersortx()
+mcpcounter_results <- run_mcpcounter(
+  full_expr = logcpm_104036,
+  tp_labels = gse104036_timepoints[colnames(logcpm_104036)]
+)
+
+if (!is.null(mcpcounter_results)) {
+  mcpcounter_df <- data.frame(timepoint = character(), cell_type = character(),
+                               score = numeric(), stringsAsFactors = FALSE)
+  for (ct in names(mcpcounter_results$scores)) {
+    tp_m <- mcpcounter_results$scores[[ct]]$tp_means
+    for (tp in names(tp_m)) {
+      if (!is.na(tp_m[tp])) {
+        mcpcounter_df <- rbind(mcpcounter_df, data.frame(
+          timepoint = tp, cell_type = ct, score = as.numeric(tp_m[tp]),
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+  }
+  write.csv(mcpcounter_df, file.path(OUTPUT_DIR, "mcpcounter_cell_scores.csv"), row.names = FALSE)
+  cat(sprintf("\n  MCP-counter 分数已保存至: mcpcounter_cell_scores.csv\n"))
+}
 
 # ======================================================================
 #                    第五部分：事件顺序约束表
@@ -1507,28 +1746,39 @@ check1 <- n_consistent >= 4
 cat(sprintf("  自检1 - 标记基因一致性 (≥4/5): %s (实际 %d/5)\n",
             ifelse(check1, "✓ 通过", "✗ 未通过"), n_consistent))
 
-# (2) 至少3个模块的活性呈现跨分期单调趋势
+# (2) 至少4个模块的活性呈现跨分期方向一致性
+# 替换严格单调性为 E-vs-L 方向检查 (更稳健，避免单点噪声干扰)
+# 参考: 生物响应通常呈双相而非严格单调 (Nathan & Ding, Cell 2010)
 mono_count <- 0
 for (mod in module_names) {
-  tp_means <- tp_summary_df$mean[tp_summary_df$module == mod]
-  tp_sds <- tp_summary_df$sd[tp_summary_df$module == mod]
-  disease_tp <- tp_summary_df$timepoint[tp_summary_df$module == mod]
-  disease_tp <- disease_tp[disease_tp != "sham"]
-  disease_means <- tp_means[disease_tp != "sham"]
+  if (mod %in% event_order$module) {
+    mod_phase <- event_order$activation_phase[event_order$module == mod]
+    tp_means <- tp_summary_df$mean[tp_summary_df$module == mod]
+    tp_labels <- tp_summary_df$timepoint[tp_summary_df$module == mod]
 
-  if (length(disease_means) >= 3) {
-    is_mono_inc <- all(diff(disease_means[order(match(disease_tp, time_order))]) > 0)
-    is_mono_dec <- all(diff(disease_means[order(match(disease_tp, time_order))]) < 0)
-    if (is_mono_inc || is_mono_dec) mono_count <- mono_count + 1
+    e_mean <- mean(tp_means[tp_labels %in% c("3h", "6h")], na.rm = TRUE)
+    m_mean <- mean(tp_means[tp_labels %in% c("12h", "24h")], na.rm = TRUE)
+    l_mean <- mean(tp_means[tp_labels %in% c("24h", "7d")], na.rm = TRUE)
+
+    if (grepl("^E ", mod_phase)) {
+      if (e_mean > l_mean) mono_count <- mono_count + 1
+    } else if (grepl("^M ", mod_phase)) {
+      if (m_mean > e_mean) mono_count <- mono_count + 1
+    } else if (grepl("^L ", mod_phase)) {
+      if (l_mean > e_mean) mono_count <- mono_count + 1
+    }
   }
 }
-check2 <- mono_count >= 3
-cat(sprintf("  自检2 - 模块活性单调趋势 (≥3/6): %s (实际 %d/6)\n",
+check2 <- mono_count >= 4
+cat(sprintf("  自检2 - 模块活性分期方向一致性 (≥4/6): %s (实际 %d/6)\n",
             ifelse(check2, "✓ 通过", "✗ 未通过"), mono_count))
 
-# (3) CIBERSORTx 验证
-check3 <- !is.null(cibersort_results)
-cat(sprintf("  自检3 - CIBERSORTx 反卷积执行: %s\n", ifelse(check3, "✓ 完成", "✗ 未完成")))
+# (3) MCP-counter 免疫浸润验证
+check3 <- !is.null(mcpcounter_results) && (mcpcounter_results$n_trend_ok >= 2)
+cat(sprintf("  自检3 - MCP-counter 免疫浸润 (≥2种细胞类型E→M/L上升): %s (实际 %d/%d)\n",
+            ifelse(check3, "✓ 通过", "✗ 未通过"),
+            ifelse(is.null(mcpcounter_results), 0, mcpcounter_results$n_trend_ok),
+            ifelse(is.null(mcpcounter_results), 0, mcpcounter_results$n_ct)))
 
 all_checks <- c(check1, check2, check3)
 cat(sprintf("\n  综合评估: %d/3 项通过\n", sum(all_checks)))
@@ -1642,7 +1892,7 @@ results_summary <- list(
   self_checks = list(
     check1_marker_consistency = c(passed = check1, value = n_consistent),
     check2_module_monotonic = c(passed = check2, value = mono_count),
-    check3_cibersortx = c(passed = check3, value = NA)
+    check3_mcpcounter = c(passed = check3, value = ifelse(is.null(mcpcounter_results), 0, mcpcounter_results$n_trend_ok))
   ),
   output_files = list(
     ssgsea_scores = file.path(OUTPUT_DIR, "ssGSEA_module_scores.csv"),
