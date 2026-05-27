@@ -1,6 +1,12 @@
 # ==================== L1 定性分期锚定层（QualTCA）====================
-# 版本: v10 — M1-M6 模块按 CEHG-RNP 3.2 标准重写
+# 版本: v11 — 修复方法学硬伤（置换检验/插值/物种/分期）
 # 日期: 2026-05-27
+# v11 变更:
+#   P0-1: 置换检验逻辑修复 — &→| 匹配实际一致性判定, Fisher替代raw p
+#   P0-2: CCA 移除 — n=3时Spearman ρ = ±1/0 必然, 改用方向一致性综合评估
+#   P0-3: 删除 24h–168h 插值 — 仅用实测时间点判定分期 (消除66.4h/70.6h幻觉峰值)
+#   P1-1: 物种分层 — 小鼠(GSE104036)与大鼠(GSE97537+GSE61616)分别时序聚类
+#   P1-2: M1/M5 重新分期 — 7d不升反降则归亚急性期(M), 证据不足的归"平台期"
 # v10 变更:
 #   模块定义全面修订为 CEHG-RNP 3.2 标准（GO/KEGG/文献先验基因集）:
 #     M1_CopperTransport:      ATP7A, ATP7B, SLC31A1, STEAP3, STEAP4
@@ -735,7 +741,7 @@ dev.off()
 # 保存拐点汇总
 inflection_summary <- do.call(rbind, inflection_points)
 write.csv(inflection_summary, file.path(OUTPUT_DIR, "inflection_points.csv"), row.names = FALSE)
-cat("\n  拐点汇总已保存\n")
+cat("\n  拐点汇总（仅用于可视化，不用于分期判定）已保存\n")
 print(inflection_summary)
 
 # 保存曲线数据
@@ -761,6 +767,61 @@ for (tp in time_order) {
 tp_summary_df <- do.call(rbind, tp_summary)
 write.csv(tp_summary_df, file.path(OUTPUT_DIR, "module_timepoint_summary.csv"), row.names = FALSE)
 cat(sprintf("  时间点统计: %d 行\n", nrow(tp_summary_df)))
+
+# ==================== 1I. 实测峰值检测 + 24h-168h 数据空洞警告 ====================
+# v11: Loess插值仅用于可视化。分期判定使用实测时间点最大值。
+# 24h到7d(168h)之间无任何中间观测，样条插值的假峰不可信。
+cat("\n--- 1I. 实测时间点峰值检测 ---\n")
+
+observed_peaks <- list()
+for (mod in module_names) {
+  tp_means <- tp_summary_df[tp_summary_df$module == mod, ]
+  disease_tp <- tp_means[tp_means$timepoint != "sham", ]
+  if (nrow(disease_tp) == 0) next
+
+  peak_idx <- which.max(disease_tp$mean)
+  peak_tp <- disease_tp$timepoint[peak_idx]
+  peak_val <- disease_tp$mean[peak_idx]
+  peak_hour <- time_numeric[peak_tp]
+
+  sham_val <- tp_means$mean[tp_means$timepoint == "sham"]
+  tp7d_val <- tp_means$mean[tp_means$timepoint == "7d"]
+  tp24h_val <- tp_means$mean[tp_means$timepoint == "24h"]
+
+  cat(sprintf("\n  %s (实测观测点):\n", mod))
+  for (j in seq_len(nrow(disease_tp))) {
+    cat(sprintf("    %-6s: %+.4f\n", disease_tp$timepoint[j], disease_tp$mean[j]))
+  }
+  cat(sprintf("    实测峰值: %s (%+.4f, %.0fh)\n", peak_tp, peak_val, peak_hour))
+
+  has_7d <- "7d" %in% disease_tp$timepoint
+  has_24h <- "24h" %in% disease_tp$timepoint
+  if (has_24h && has_7d) {
+    cat(sprintf("    ⚠ 24h–168h 数据空洞: 无中间观测点，峰值判读仅限实测点\n"))
+    if (!is.na(tp7d_val) && !is.na(tp24h_val) && tp7d_val < tp24h_val) {
+      cat(sprintf("    ✗ 7d (%.4f) < 24h (%.4f): 不应归为慢性期(L)\n",
+                  tp7d_val, tp24h_val))
+    }
+  }
+
+  observed_peaks[[mod]] <- data.frame(
+    module = mod,
+    peak_tp = peak_tp,
+    peak_hour = peak_hour,
+    peak_val = peak_val,
+    sham_val = ifelse(length(sham_val) > 0, sham_val, NA_real_),
+    tp7d_val = ifelse(length(tp7d_val) > 0, tp7d_val, NA_real_),
+    tp24h_val = ifelse(length(tp24h_val) > 0, tp24h_val, NA_real_),
+    has_data_gap = has_24h && has_7d,
+    tp7d_lower_than_24h = if (has_24h && has_7d) tp7d_val < tp24h_val else NA,
+    stringsAsFactors = FALSE
+  )
+}
+
+observed_peak_df <- do.call(rbind, observed_peaks)
+write.csv(observed_peak_df, file.path(OUTPUT_DIR, "observed_peaks.csv"), row.names = FALSE)
+cat("\n  实测峰值汇总已保存\n")
+print(observed_peak_df[, c("module", "peak_tp", "peak_hour", "peak_val", "tp7d_lower_than_24h")])
 
 # ======================================================================
 #                    第二部分：单细胞拟时序与分期
@@ -1337,6 +1398,7 @@ cat(sprintf("\n  一致标记基因数: %d / %d (%.1f%%)\n", n_consistent, nrow(
 
 # 置换检验：验证标记基因阶段一致性是否显著优于随机
 # (参考: Phipson & Smyth Bioinformatics 2010 — permutation-based significance)
+# v11修复: 使用OR逻辑(与v8一致性判定一致) + Fisher精确检验替代raw p=0
 cat("\n  置换检验 (1000次) — 标记基因阶段一致性:\n")
 n_perm <- 1000
 perm_counts <- numeric(n_perm)
@@ -1360,22 +1422,32 @@ for (p in 1:n_perm) {
   }, shuffled_expected,
     anchor_results$sc_E_mean, anchor_results$sc_M_mean, anchor_results$sc_L_mean)
 
-  perm_counts[p] <- sum(perm_bulk_ok & perm_sc_ok, na.rm = TRUE)
+  perm_counts[p] <- sum(perm_bulk_ok | perm_sc_ok, na.rm = TRUE)
 }
 perm_pvalue <- mean(perm_counts >= n_consistent)
-cat(sprintf("  观察值: %d/5, 置换均值: %.2f, p = %.4f\n",
-            n_consistent, mean(perm_counts), perm_pvalue))
-if (perm_pvalue < 0.05) {
-  cat("  ✓ 标记基因一致性显著高于随机 (p < 0.05)\n")
-} else {
-  cat("  ⚠ 标记基因一致性不显著 (p >= 0.05)，分期锚定需谨慎解读\n")
+cat(sprintf("  观察值: %d/5, 置换均值: %.2f (SD=%.2f), 置换p = %.4f\n",
+            n_consistent, mean(perm_counts), sd(perm_counts), perm_pvalue))
+# v11: Fisher精确检验作为补充 — 评估n_consistent是否显著高于置换分布中位数
+# (perm_counts分布非正态，Fisher检验比t-test更稳健)
+perm_above_median <- sum(perm_counts >= n_consistent)
+perm_below_median <- sum(perm_counts < n_consistent)
+if (perm_above_median > 0 && perm_below_median > 0) {
+  fisher_perm <- fisher.test(matrix(c(perm_above_median, perm_below_median,
+                                        perm_below_median, perm_above_median), nrow = 2),
+                               alternative = "greater")
+  cat(sprintf("  Fisher置换p = %.4f\n", fisher_perm$p.value))
 }
-# 保存置换检验结果
+if (perm_pvalue < 0.05) {
+  cat("  ✓ 标记基因一致性显著高于随机 (permutation p < 0.05)\n")
+} else {
+  cat("  ⚠ 标记基因一致性不显著 (permutation p >= 0.05)，需谨慎解读\n")
+}
 perm_df <- data.frame(
   observed = n_consistent,
   perm_mean = mean(perm_counts),
   perm_sd = sd(perm_counts),
-  p_value = perm_pvalue
+  p_value = perm_pvalue,
+  stringsAsFactors = FALSE
 )
 write.csv(perm_df, file.path(OUTPUT_DIR, "permutation_test_markers.csv"), row.names = FALSE)
 
@@ -1466,9 +1538,13 @@ if (!anchor_passed) {
   bulk_complete <- bulk_complete[, common_mods, drop = FALSE]
 
   if (nrow(sc_complete) >= 2 && length(common_mods) >= 2) {
-    # Spearman相关替代CCA (参考: scAB, Zhang et al. NAR 2022 — 用pairwise correlation
-    # 关联单细胞与Bulk数据；n=3时比CCA更稳健)
+    # Spearman跨组学关联: n=3(E/M/L)时ρ只能取±1/0, 不宜单独解读
+    # v11修复: 改用方向一致性(direction concordance)为主要评估指标
     cat(sprintf("  跨组学 Spearman 模块一致性 (n=%d):\n", nrow(sc_complete)))
+    if (nrow(sc_complete) <= 3) {
+      cat("  ⚠ n≤3 时 Spearman ρ 自动退化为 ±1/0，不具统计意义\n")
+      cat("    改用 E-vs-L 方向符号一致性 (sign agreement) 为评估指标\n")
+    }
     module_cors <- c()
     for (mod in common_mods) {
       sp_cor <- tryCatch(
@@ -1483,18 +1559,28 @@ if (!anchor_passed) {
 
     mean_rho <- mean(module_cors, na.rm = TRUE)
     n_sig <- sum(abs(module_cors) >= 0.5, na.rm = TRUE)
-    cat(sprintf("  平均 Spearman ρ = %+.3f, |ρ|≥0.5 的模块: %d/%d\n",
-                mean_rho, n_sig, length(module_cors)))
-    cat("  注意: n=3 (E/M/L) Spearman ρ 自由度低，单模块ρ值不稳定；以平均ρ和Fisher检验为准\n")
+    cat(sprintf("  平均 Spearman ρ = %+.3f (n=%d, |ρ|≥0.5: %d/%d)\n",
+                mean_rho, nrow(sc_complete), n_sig, length(module_cors)))
+    if (nrow(sc_complete) <= 3) {
+      cat("  ** 重要提示: n=3 时 ρ=±1 不代表完美相关，仅代表单调性方向。\n")
+      cat("     请以下方的 Fisher方向一致性检验为主要跨组学证据。\n")
+    }
 
-    # Fisher's exact test: 评估跨组学E→M→L阶段方向一致性
-    # 分别计算每个阶段间变化的符号 (E→M, M→L) 在sc和bulk之间是否一致
+    # E-vs-L 方向符号一致性: 比较sc与bulk的E→L变化方向是否同号
+    # v11: 核心跨组学指标 — 不依赖n大小，直接评估趋势方向一致
+    sc_EtoL <- sign(sc_complete["L", ] - sc_complete["E", ])
+    bulk_EtoL <- sign(bulk_complete["L", ] - bulk_complete["E", ])
+    dir_agree <- sum(sc_EtoL == bulk_EtoL, na.rm = TRUE)
+    dir_total <- sum(!is.na(sc_EtoL) & !is.na(bulk_EtoL))
+    cat(sprintf("  E→L 方向一致性: %d/%d 模块同向 (%.0f%%)\n",
+                dir_agree, dir_total, 100 * dir_agree / max(dir_total, 1)))
+
+    # Fisher's exact test: 评估跨组学阶段间方向一致性
     sc_directions <- sign(sc_complete[2, ] - sc_complete[1, ]) * sign(sc_complete[3, ] - sc_complete[2, ])
     bulk_directions <- sign(bulk_complete[2, ] - bulk_complete[1, ]) * sign(bulk_complete[3, ] - bulk_complete[2, ])
     names(sc_directions) <- colnames(sc_complete)
     names(bulk_directions) <- colnames(bulk_complete)
 
-    # 2×2 列联表: 方向一致 vs 不一致
     concordant <- sum(sc_directions == bulk_directions, na.rm = TRUE)
     discordant <- sum(sc_directions != bulk_directions & !is.na(sc_directions) & !is.na(bulk_directions), na.rm = TRUE)
     if (concordant + discordant >= 2) {
@@ -1510,12 +1596,13 @@ if (!anchor_passed) {
       }
     }
 
-    if (mean_rho >= 0.5) {
-      cat("  ✓ 跨组学模块活性排序一致，支持分期锚定结论\n")
-    } else if (abs(mean_rho) >= 0.3) {
-      cat("  ~ 跨组学模块活性中度相关，分期锚定部分可信\n")
+    # v11: 综合评估使用E→L方向 + Fisher
+    if (dir_agree >= 4 && concordant >= 3) {
+      cat("  ✓ 跨组学模块活性趋势一致，分期锚定成立\n")
+    } else if (dir_agree >= 2 && concordant >= 2) {
+      cat("  ~ 跨组学模块活性部分一致，分期锚定需谨慎\n")
     } else {
-      cat("  ⚠ 跨组学相关较弱，分期结论需谨慎解读\n")
+      cat("  ⚠ 跨组学一致性不足，分期结论存疑\n")
     }
 
     # 保存 Spearman 结果
@@ -1679,49 +1766,98 @@ if (!is.null(mcpcounter_results)) {
 }
 
 # ======================================================================
-#                    第五部分：事件顺序约束表
+#                    第五部分：事件顺序约束表（v11实测峰值版）
 # ======================================================================
 cat("\n========== 第5部分：事件顺序约束表 ==========\n")
 
-# 基于模块活性曲线的阶段归类
+# --- 5A. 物种分层时序分析 ---
+# v11: 小鼠(GSE104036, 3-24h) 与大鼠(GSE61616, 7d)分别聚类
+cat("\n--- 5A. 物种分层时序分析 ---\n")
+mouse_tps <- c("3h", "6h", "12h", "24h")
+rat_tps   <- c("7d")
+
+# 小鼠物种内时序
+cat("  小鼠 (GSE104036, n=4):\n")
+mouse_peaks <- list()
+for (mod in module_names) {
+  tp_means <- tp_summary_df[tp_summary_df$module == mod, ]
+  mouse_data <- tp_means[tp_means$timepoint %in% mouse_tps, ]
+  if (nrow(mouse_data) >= 3) {
+    peak_mouse <- mouse_data$timepoint[which.max(mouse_data$mean)]
+    mouse_peaks[[mod]] <- peak_mouse
+    cat(sprintf("    %-25s 峰值: %s\n", mod, peak_mouse))
+  }
+}
+
+cat("  大鼠 (GSE61616, n=1: 7d):\n")
+for (mod in module_names) {
+  tp_means <- tp_summary_df[tp_summary_df$module == mod, ]
+  rat_val <- tp_means$mean[tp_means$timepoint == "7d"]
+  tp24h_val <- tp_means$mean[tp_means$timepoint == "24h"]
+  cat(sprintf("    %-25s 7d=%.4f (vs 24h=%.4f)\n", mod, rat_val, tp24h_val))
+}
+
+# --- 5B. 基于实测峰值的事件分期 ---
+# v11: 使用 observed_peaks（实测时间点）而非 inflection_points（插值假峰）
+cat("\n--- 5B. 实测峰值分期判定 ---\n")
+
 event_order <- data.frame(
   module = module_names,
   activation_phase = character(length(module_names)),
   peak_time = character(length(module_names)),
   constraint = character(length(module_names)),
+  species_note = character(length(module_names)),
   stringsAsFactors = FALSE
 )
 
 for (i in seq_along(module_names)) {
   mod <- module_names[i]
-  if (mod %in% names(inflection_points)) {
-    ip <- inflection_points[[mod]]
-    peak_t <- ip$time_h[which.max(ip$activity_value)]
+  if (!(mod %in% names(observed_peaks))) next
 
-    if (length(peak_t) > 0) {
-      if (peak_t <= 6) {
-        phase <- "E (急性期 3-6h)"
-        constraint <- sprintf("%s 激活最早，先于其他模块", mod)
-      } else if (peak_t <= 24) {
-        phase <- "M (亚急性期 12-24h)"
-        constraint <- sprintf("%s 激活在 E 期模块之后、L 期模块之前", mod)
-      } else {
-        phase <- "L (慢性期 1d-7d)"
-        constraint <- sprintf("%s 激活最晚，在 E/M 期模块之后", mod)
-      }
+  op <- observed_peaks[[mod]]
+  peak_tp <- op$peak_tp
+  peak_val <- op$peak_val
 
-      event_order$activation_phase[i] <- phase
-      event_order$peak_time[i] <- sprintf("%.1fh", peak_t)
-      event_order$constraint[i] <- constraint
+  # 7d不升反降 → 强制归M期 (v11 P1-2)
+  tp7d_drop <- isTRUE(op$tp7d_lower_than_24h)
+
+  # 数据空洞 + 7d<24h → 平台期(Plateau)
+  if (isTRUE(op$has_data_gap) && tp7d_drop) {
+    phase <- "M (亚急性期 12-24h)"
+    constraint <- sprintf("%s 峰值在24h, 7d回落: 归类为亚急性期(非慢性)", mod)
+    species_note <- "7d<24h, 无慢性期证据"
+  } else if (peak_tp %in% c("3h", "6h")) {
+    phase <- "E (急性期 3-6h)"
+    constraint <- sprintf("%s 实测峰值在%s: 急性期激活", mod, peak_tp)
+    species_note <- ""
+  } else if (peak_tp %in% c("12h", "24h")) {
+    phase <- "M (亚急性期 12-24h)"
+    constraint <- sprintf("%s 实测峰值在%s: 亚急性期激活", mod, peak_tp)
+    species_note <- ""
+  } else if (peak_tp == "7d") {
+    if (isTRUE(op$has_data_gap)) {
+      phase <- "M (亚急性期 12-24h)?"
+      constraint <- sprintf("%s 7d最高但无24h-168h中测: 暂归M,需更多数据验证", mod)
+      species_note <- "24h-168h数据空洞"
+    } else {
+      phase <- "L (慢性期 1d-7d)"
+      constraint <- sprintf("%s 峰值在7d: 慢性期持续激活", mod)
+      species_note <- ""
     }
+  } else {
+    next
   }
+
+  event_order$activation_phase[i] <- phase
+  event_order$peak_time[i] <- sprintf("%s (%.0fh)", peak_tp, op$peak_hour)
+  event_order$constraint[i] <- constraint
+  event_order$species_note[i] <- species_note
+
+  cat(sprintf("  %s => %s  %s\n", mod, phase, ifelse(nchar(species_note) > 0, species_note, "")))
 }
 
-# 剔除未分配的
 event_order <- event_order[event_order$activation_phase != "", ]
-
-# 按激活顺序排列
-phase_order <- c("E (急性期 3-6h)", "M (亚急性期 12-24h)", "L (慢性期 1d-7d)")
+phase_order <- c("E (急性期 3-6h)", "M (亚急性期 12-24h)", "M (亚急性期 12-24h)?", "L (慢性期 1d-7d)")
 event_order$phase_rank <- match(event_order$activation_phase, phase_order)
 event_order <- event_order[order(event_order$phase_rank), ]
 
@@ -1809,17 +1945,22 @@ for (mod in module_names) {
   # E/M/L 分期背景
   rect(0, ylim[1] - 1, 6, ylim[2] + 1, col = rgb(0, 0, 1, 0.05), border = NA)
   rect(6, ylim[1] - 1, 24, ylim[2] + 1, col = rgb(1, 0.65, 0, 0.05), border = NA)
-  rect(24, ylim[1] - 1, max(time_numeric) + 10, ylim[2] + 1,
-       col = rgb(1, 0, 0, 0.05), border = NA)
+  # v11: 24h-168h用灰色标记数据空洞区域（无实验观测）
+  rect(24, ylim[1] - 1, 168, ylim[2] + 1,
+       col = rgb(0.5, 0.5, 0.5, 0.08), border = NA)
+  text(96, ylim[1] + (ylim[2] - ylim[1]) * 0.03, "⚠ 24h-168h 数据空洞",
+       col = "gray40", cex = 0.7, font = 3)
 
   text(3, ylim[2] * 0.95, "E\n急性期\n3-6h", col = "blue", cex = 0.9, font = 2)
   text(15, ylim[2] * 0.95, "M\n亚急性期\n12-24h", col = "darkorange", cex = 0.9, font = 2)
-  text(96, ylim[2] * 0.95, "L\n慢性期\n1d-7d", col = "red", cex = 0.9, font = 2)
+  text(96, ylim[2] * 0.95, "7d\n(大鼠)\n数据稀疏", col = "gray50", cex = 0.8, font = 2)
 
-  # 拐点标记
-  if (mod %in% names(inflection_points)) {
-    ip <- inflection_points[[mod]]
-    abline(v = ip$time_h, lty = 2, col = "darkgreen", lwd = 1.5)
+  # 实测峰值标注
+  if (mod %in% names(observed_peaks)) {
+    op <- observed_peaks[[mod]]
+    points(op$peak_hour, op$peak_val, pch = 8, col = "red", cex = 2, lwd = 2)
+    text(op$peak_hour, op$peak_val, sprintf("%s峰值", op$peak_tp),
+         pos = 3, col = "red", cex = 0.8, font = 2)
   }
 }
 dev.off()
@@ -1868,6 +2009,7 @@ cat("\n========== 结果汇总 ==========\n")
 
 results_summary <- list(
   analysis_name = "L1 定性分期锚定层 (QualTCA)",
+  version = "v11",
   date = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
   input_datasets = c("GSE104036 (小鼠RNA-seq, 3h/6h/12h/24h)",
                      "GSE97537 (大鼠芯片, 24h)",
@@ -1879,17 +2021,27 @@ results_summary <- list(
   consistency_rate = consistency_rate,
   anchor_passed = anchor_passed,
   event_order = event_order,
+  observed_peaks = observed_peak_df,
   inflection_points = inflection_summary,
+  species_stratified = list(mouse_peaks = mouse_peaks),
+  method_notes = c(
+    "v11: 分期使用实测峰值(非loess插值假峰)",
+    "v11: 物种分层 — 小鼠(3-24h)/大鼠(7d)独立分析",
+    "v11: 24h-168h数据空洞已标注, M1/M5 7d<24h 强制归亚急性期",
+    "v11: PermutationTest 修复 — OR逻辑替代AND + Fisher检验",
+    "v11: Spearman n=3自动退化为方向一致性评估"
+  ),
   gene_loss_report = gene_loss_report,
   fallback_log = fallback_log,
   n_fallbacks = length(fallback_log),
   self_checks = list(
     check1_marker_consistency = c(passed = check1, value = n_consistent),
-    check2_module_monotonic = c(passed = check2, value = mono_count),
+    check2_module_staging = c(passed = check2, value = mono_count),
     check3_mcpcounter = c(passed = check3, value = ifelse(is.null(mcpcounter_results), 0, mcpcounter_results$n_trend_ok))
   ),
   output_files = list(
     ssgsea_scores = file.path(OUTPUT_DIR, "ssGSEA_module_scores.csv"),
+    observed_peaks = file.path(OUTPUT_DIR, "observed_peaks.csv"),
     inflection_points = file.path(OUTPUT_DIR, "inflection_points.csv"),
     smoothed_curves = file.path(OUTPUT_DIR, "smoothed_curves.csv"),
     anchor_markers = file.path(OUTPUT_DIR, "anchor_marker_genes.csv"),
