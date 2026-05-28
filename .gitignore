@@ -1,77 +1,85 @@
-# .gitignore for CIRI-cuproptosis-causal-discovery
-
-# Python
+# Environment
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-venv/
-.venv/
-env/
-.ENV
+*.pyc
+*.pyo
+.env
+.venv
+conda_envs/
 
-# R
-.Rhistory
-.RData
-.Ruserdata
-*.Rproj.user
-.Rproj.user/
-
-# Results and figures (keep in local, not in git)
-results/
-figures/
-
-# Data (too large for git)
+# Large data directories
+D:/
 data/
-*.h5ad
-*.loom
-*.rds
-*.Rds
-*.csv
-*.tsv
-*.gz
-*.zip
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
+local_data/
+downloaded_raw/
+raw_pdb_files/
+PDB_files/
+pdb_structures/
+processed_pdb_files/
+processed/
+processed_v4/
+processed_v8/
+analysis_results/
+batch_output/
+causal_analysis_results/
+diagnostics_v4/
+diagnostics_v5/
+downloaded_raw/
+docking_results_merged/
+enrichment_analysis/
+figure_data/
+figures_output/
+figures_v7/
+figures_v8/
 logs/
+logs_v4/
+logs_v5/
+logs_v55/
+logs_v56/
+molecular_docking/
+output/
+pipeline_summary/
+results/
+results_summary/
+subgraph_analysis/
+utils/
+analysis_results/
 
-# Models
+# Model directories
 models/
-*.pt
-*.pth
-*.ckpt
+models_v4/
+models_v5/
+models_v55/
+models_v56/
+models_v6/
+models_v61/
+models_v7/
+models_v8/
 
-# Temporary files
+# Results & reports
+*.md
+*.txt
+*.log
+*.pdf
+*.png
+*.svg
+*.jpg
+*.jpeg
+*.gif
+
+# Large files
+*.csv
+*.xlsx
+*.ps1
+*.bat
+*.sh
+
+# Temp files
+~$*
 *.tmp
-temp/
-Rplots.pdf
+*.swp
+
+# Script outputs
+disease_genes_for_GAT.csv
+common_DEGs.csv
+union_DEGs.csv
+deg_temporal_summary.xlsx
