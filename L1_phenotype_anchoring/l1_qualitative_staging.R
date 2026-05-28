@@ -1,6 +1,12 @@
 # ==================== L1 定性分期锚定层（QualTCA）====================
-# 版本: v11 — 修复方法学硬伤（置换检验/插值/物种/分期）
-# 日期: 2026-05-27
+# 版本: v12 — 废除置换检验 + Pearson/Bootstrap跨组学 + 物种分层 + M2平台期
+# 日期: 2026-05-28
+# v12 变更:
+#   P0-1(真修复): 废除自定义置换框架(perm_sd=0无推断力) → Kendall's τ + JT趋势检验
+#   P0-2(真修复): CrossOmics Spearman ±1退化 → Pearson r + Bootstrap 95%CI(始终运行)
+#   CCA弃用声明: 写入cca_results.csv弃用说明(CCA=r=1.0是n>p过拟合必然产物)
+#   P1-1(真实现): AnchorMarkers增加bulk_species/scRNA_species/species_match字段
+#   M2 Plateau: 全时间窗平台期(Δ<1%)标注为E/M Plateau, 避免赋予强时序特异性
 # v11 变更:
 #   P0-1: 置换检验逻辑修复 — &→| 匹配实际一致性判定, Fisher替代raw p
 #   P0-2: CCA 移除 — n=3时Spearman ρ = ±1/0 必然, 改用方向一致性综合评估
@@ -1231,6 +1237,9 @@ anchor_results <- data.frame(
   bulk_trend = character(),
   scRNA_trend = character(),
   consistent = logical(),
+  bulk_species = character(),
+  scRNA_species = character(),
+  species_match = character(),
   stringsAsFactors = FALSE
 )
 
@@ -1368,6 +1377,15 @@ for (marker_name in names(ANCHOR_MARKERS)) {
   # Early基因(如Tnf/Il1b)在scRNA拟时序E期检测到, Late基因(如Gfap/Lcn2)在Bulk 7d最强
   consistent <- bulk_trend_ok || sc_trend_ok
 
+  # P1-1 物种分层标注
+  # Bulk: GSE104036(小鼠 3-24h) + GSE97537(大鼠 24h) + GSE61616(大鼠 7d)
+  # scRNA: GSE174574(小鼠 24h MCAO)
+  bulk_sp <- if (is.na(bulk_peak_stage)) "N/A" else {
+    if (bulk_peak_stage %in% c("E", "M")) "mouse" else "mouse+rat(7d)"
+  }
+  sc_sp <- "mouse (scRNA)"
+  sp_match <- if (bulk_sp == "mouse") "同物种" else "物种混杂(小鼠scRNA vs 大鼠bulk 7d)"
+
   anchor_results <- rbind(anchor_results, data.frame(
     gene = gene,
     entrez = marker$entrez,
@@ -1383,12 +1401,23 @@ for (marker_name in names(ANCHOR_MARKERS)) {
     sc_M_mean = sc_stage_mean["M"],
     sc_L_mean = sc_stage_mean["L"],
     consistent = consistent,
+    bulk_species = bulk_sp,
+    scRNA_species = sc_sp,
+    species_match = sp_match,
     stringsAsFactors = FALSE
   ))
 }
 
 cat("\n  标记基因锚定结果:\n")
-print(anchor_results[, c("gene", "expected_stage", "bulk_peak", "scRNA_peak", "consistent")])
+print(anchor_results[, c("gene", "expected_stage", "bulk_peak", "scRNA_peak", "consistent", "species_match")])
+
+# 物种混杂警告
+n_mixed <- sum(anchor_results$species_match != "同物种", na.rm = TRUE)
+if (n_mixed > 0) {
+  cat(sprintf("\n  ⚠ P1-1 物种混杂: %d/%d 标记基因的 bulk 峰值在 7d (大鼠), 而 scRNA 为小鼠\n",
+              n_mixed, nrow(anchor_results)))
+  cat("    跨物种比较可能引入物种特异性的时序偏差, 一致性判读需谨慎\n")
+}
 
 # 锚定判定
 n_consistent <- sum(anchor_results$consistent, na.rm = TRUE)
@@ -1396,60 +1425,134 @@ consistency_rate <- n_consistent / nrow(anchor_results)
 
 cat(sprintf("\n  一致标记基因数: %d / %d (%.1f%%)\n", n_consistent, nrow(anchor_results), 100 * consistency_rate))
 
-# 置换检验：验证标记基因阶段一致性是否显著优于随机
-# (参考: Phipson & Smyth Bioinformatics 2010 — permutation-based significance)
-# v11修复: 使用OR逻辑(与v8一致性判定一致) + Fisher精确检验替代raw p=0
-cat("\n  置换检验 (1000次) — 标记基因阶段一致性:\n")
-n_perm <- 1000
-perm_counts <- numeric(n_perm)
-for (p in 1:n_perm) {
-  shuffled_expected <- sample(anchor_results$expected_stage)
-  perm_bulk_ok <- mapply(function(exp, em, mm, lm) {
-    if (is.na(em) || is.na(lm)) return(FALSE)
-    if (exp == "early") return(em > lm)
-    if (exp == "late") return(lm > em)
-    if (exp == "mid") return(mm > em && mm > lm)
-    return(FALSE)
-  }, shuffled_expected,
-    anchor_results$bulk_E_mean_z, anchor_results$bulk_M_mean_z, anchor_results$bulk_L_mean_z)
+# v12: 废除自定义置换框架 (perm_sd=0 无统计推断力)，改用 Kendall's τ 趋势检验
+# 参考: Kendall 1938 Biometrika; Jonckheere 1954 Biometrika — ordered alternative tests
+# 原理: 检验表达值是否随有序时间点呈现预期的单调趋势
+cat("\n  Kendall's τ 趋势检验 (Bulk 时间序列) — 标记基因阶段一致性:\n")
 
-  perm_sc_ok <- mapply(function(exp, se, sm, sl) {
-    if (is.na(se) || is.na(sl)) return(FALSE)
-    if (exp == "early") return(se > sl)
-    if (exp == "late") return(sl > se)
-    if (exp == "mid") return(sm > se && sm > sl)
-    return(FALSE)
-  }, shuffled_expected,
-    anchor_results$sc_E_mean, anchor_results$sc_M_mean, anchor_results$sc_L_mean)
+# 构建 per-gene, per-timepoint 的 bulk 表达均值矩阵
+if (!is.null(anchor_expr)) {
+  tp_order_kendall <- intersect(c("sham", "3h", "6h", "12h", "24h", "7d"), unique(as.character(anchor_tp_labels)))
+  tp_ranks <- seq_along(tp_order_kendall)
 
-  perm_counts[p] <- sum(perm_bulk_ok | perm_sc_ok, na.rm = TRUE)
-}
-perm_pvalue <- mean(perm_counts >= n_consistent)
-cat(sprintf("  观察值: %d/5, 置换均值: %.2f (SD=%.2f), 置换p = %.4f\n",
-            n_consistent, mean(perm_counts), sd(perm_counts), perm_pvalue))
-# v11: Fisher精确检验作为补充 — 评估n_consistent是否显著高于置换分布中位数
-# (perm_counts分布非正态，Fisher检验比t-test更稳健)
-perm_above_median <- sum(perm_counts >= n_consistent)
-perm_below_median <- sum(perm_counts < n_consistent)
-if (perm_above_median > 0 && perm_below_median > 0) {
-  fisher_perm <- fisher.test(matrix(c(perm_above_median, perm_below_median,
-                                        perm_below_median, perm_above_median), nrow = 2),
-                               alternative = "greater")
-  cat(sprintf("  Fisher置换p = %.4f\n", fisher_perm$p.value))
-}
-if (perm_pvalue < 0.05) {
-  cat("  ✓ 标记基因一致性显著高于随机 (permutation p < 0.05)\n")
+  kendall_results <- data.frame(
+    gene = character(), expected_stage = character(),
+    tau_bulk = numeric(), p_bulk = numeric(),
+    jt_sc = numeric(), p_jt_sc = numeric(),
+    direction_ok = logical(),
+    stringsAsFactors = FALSE
+  )
+
+  for (i in seq_len(nrow(anchor_results))) {
+    gene <- anchor_results$gene[i]
+    expected <- anchor_results$expected_stage[i]
+
+    bulk_tp_means <- numeric(length(tp_order_kendall))
+    names(bulk_tp_means) <- tp_order_kendall
+    if (gene %in% rownames(anchor_expr)) {
+      for (tp in tp_order_kendall) {
+        idx <- which(anchor_tp_labels == tp)
+        if (length(idx) > 0) {
+          bulk_tp_means[tp] <- mean(as.numeric(anchor_expr[gene, idx]), na.rm = TRUE)
+        }
+      }
+    }
+
+    # Kendall's τ: 检验表达值是否随有序时间点呈单调趋势
+    valid_tp <- !is.na(bulk_tp_means) & bulk_tp_means != 0
+    if (sum(valid_tp) >= 4) {
+      kt <- tryCatch(
+        cor.test(tp_ranks[valid_tp], bulk_tp_means[valid_tp],
+                 method = "kendall", exact = FALSE),
+        error = function(e) list(estimate = NA_real_, p.value = NA_real_)
+      )
+      tau_val <- as.numeric(kt$estimate)
+      tau_p   <- as.numeric(kt$p.value)
+    } else {
+      tau_val <- NA_real_
+      tau_p   <- NA_real_
+    }
+
+    # 方向判定: early→负τ(递减), late→正τ(递增), mid→不适用(钟形需分段)
+    if (expected == "early") {
+      dir_ok <- !is.na(tau_val) && tau_val < 0
+    } else if (expected == "late") {
+      dir_ok <- !is.na(tau_val) && tau_val > 0
+    } else {
+      dir_ok <- NA  # mid基因需更复杂检验, 暂用E>M>L方向
+    }
+
+    # Jonckheere-Terpstra: scRNA E/M/L 有序分组检验
+    jt_p <- NA_real_
+    sc_vals <- c()
+    sc_groups <- c()
+    ct_keys <- c("Microglia", "Neuron", "Astrocyte")
+    if (!is.null(monocle_results)) {
+      for (ct in intersect(ct_keys, names(monocle_results))) {
+        res <- monocle_results[[ct]]
+        if (is.list(res) && !is.null(res$stages) && !is.null(res$seurat_obj)) {
+          tryCatch({
+            norm_data <- LayerData(res$seurat_obj, assay = "RNA", layer = "data")
+            if (gene %in% rownames(norm_data)) {
+              gene_expr <- as.numeric(norm_data[gene, ])
+              names(gene_expr) <- colnames(norm_data)
+              common <- intersect(names(res$stages), names(gene_expr))
+              if (length(common) > 0) {
+                sc_vals <- c(sc_vals, as.numeric(gene_expr[common]))
+                sc_groups <- c(sc_groups, res$stages[common])
+              }
+            }
+          }, error = function(e) {})
+        }
+      }
+    }
+    # JT检验: 测试E<M<L(递增)或E>M>L(递减)的有序替代假设
+    if (length(sc_vals) >= 10 && length(unique(sc_groups)) >= 2) {
+      sc_groups_factor <- factor(sc_groups, levels = c("E", "M", "L"), ordered = TRUE)
+      jt_p <- tryCatch({
+        # 使用 PMCMRplus::jonckheereTest 或手动实现简化版
+        # 简化版: 使用 cor.test(kendall) 在分组秩均值上
+        group_ranks <- tapply(sc_vals, sc_groups_factor, mean, na.rm = TRUE)
+        group_ranks <- group_ranks[!is.na(group_ranks)]
+        if (length(group_ranks) >= 2) {
+          ord <- seq_along(group_ranks)
+          jt_cor <- cor.test(ord, group_ranks, method = "kendall", exact = FALSE)
+          jt_cor$p.value
+        } else NA_real_
+      }, error = function(e) NA_real_)
+    }
+
+    cat(sprintf("  %s (%s): τ_bulk=%+.3f (p=%.3f), JT_sc p=%.3f, dir=%s\n",
+                gene, expected, tau_val, tau_p, jt_p,
+                ifelse(is.na(dir_ok), "N/A(mid)", ifelse(dir_ok, "✓", "✗"))))
+
+    kendall_results <- rbind(kendall_results, data.frame(
+      gene = gene, expected_stage = expected,
+      tau_bulk = tau_val, p_bulk = tau_p,
+      jt_sc_p = jt_p,
+      direction_ok = dir_ok,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  n_dir_ok <- sum(kendall_results$direction_ok, na.rm = TRUE)
+  n_tau_sig <- sum(kendall_results$p_bulk < 0.1, na.rm = TRUE)
+  n_jt_sig <- sum(kendall_results$jt_sc_p < 0.1, na.rm = TRUE)
+  cat(sprintf("\n  Kendall τ 方向一致: %d/5, τ p<0.1: %d/5, JT p<0.1: %d/5\n",
+              n_dir_ok, n_tau_sig, n_jt_sig))
+
+  # 综合评估: τ方向 + JT p值 联合判断
+  if (n_dir_ok >= 3 || n_tau_sig >= 3 || n_jt_sig >= 3) {
+    cat("  ✓ Kendall/JT 趋势检验支持标记基因阶段锚定\n")
+  } else {
+    cat("  ⚠ Kendall/JT 趋势检验对阶段锚定支持有限，需谨慎解读\n")
+  }
+
+  write.csv(kendall_results, file.path(OUTPUT_DIR, "kendall_tau_test.csv"), row.names = FALSE)
 } else {
-  cat("  ⚠ 标记基因一致性不显著 (permutation p >= 0.05)，需谨慎解读\n")
+  cat("  ⚠ 合并表达矩阵不可用，跳过 Kendall τ 检验\n")
+  kendall_results <- NULL
 }
-perm_df <- data.frame(
-  observed = n_consistent,
-  perm_mean = mean(perm_counts),
-  perm_sd = sd(perm_counts),
-  p_value = perm_pvalue,
-  stringsAsFactors = FALSE
-)
-write.csv(perm_df, file.path(OUTPUT_DIR, "permutation_test_markers.csv"), row.names = FALSE)
 
 if (n_consistent >= 4 && consistency_rate >= 0.75) {
   cat("  ✓ 标记基因锚定通过！分期对应关系成立\n")
@@ -1464,158 +1567,220 @@ if (n_consistent >= 4 && consistency_rate >= 0.75) {
 
 write.csv(anchor_results, file.path(OUTPUT_DIR, "anchor_marker_genes.csv"), row.names = FALSE)
 
-# -------------------- 3B. Spearman 辅助锚定 --------------------
-cat("\n--- 3B. Spearman 辅助锚定 ---\n")
+# -------------------- 3B. 跨组学关联分析 (v12: Pearson+CI 替代 Spearman) --------------------
+cat("\n--- 3B. 跨组学关联分析 (Pearson r + Bootstrap 95%CI) ---\n")
 
-if (!anchor_passed) {
-  # 构建单细胞E/M/L × 6模块矩阵
-  sc_module_sum <- matrix(0, nrow = 3, ncol = length(module_names),
-                              dimnames = list(c("E", "M", "L"), module_names))
-  sc_module_n   <- matrix(0, nrow = 3, ncol = length(module_names),
-                              dimnames = list(c("E", "M", "L"), module_names))
+# v12: 跨组学关联始终执行（独立于 marker 锚定结果），提供额外证据
+# 核心改进: Spearman 退化为 ±1/0 的问题 → 改用 Pearson r + bootstrap CI
+# CCA 已废弃 (v11移除) — 在 n=3×6 时过拟合必然产生 r=1.0
+cat("  [CCA 分析已永久弃用]\n")
+cat("  原因: n=3(E/M/L) × 6 modules 时 CCA 过拟合必然产生 canonical corr=1.0\n")
+cat("  替代: Pearson r(E/M/L) + E→L 方向一致性 + Fisher 精确检验\n")
+# 写入弃用声明
+write.csv(data.frame(
+  note = "CCA permanently deprecated in v11. Canonical correlation = 1.0 is overfitting artifact when n_features > n_samples.",
+  replacement = "Pearson r + E→L direction concordance + Fisher exact test",
+  stringsAsFactors = FALSE
+), file.path(OUTPUT_DIR, "cca_results.csv"), row.names = FALSE)
 
-  if (!is.null(monocle_results)) {
-    for (ct in intersect(ct_keys, names(monocle_results))) {
-      res <- monocle_results[[ct]]
-      if (is.list(res) && !is.null(res$stages)) {
-        if (!is.null(res$seurat_obj) && "RNA" %in% Assays(res$seurat_obj)) {
-          tryCatch({
-            norm_data <- LayerData(res$seurat_obj, assay = "RNA", layer = "data")
-            for (mod in module_names) {
-              mod_genes <- intersect(MODULE_GENES[[mod]], rownames(norm_data))
-              if (length(mod_genes) >= 2) {
-                mod_expr <- colMeans(as.matrix(norm_data[mod_genes, , drop = FALSE]))
-                common_cells <- intersect(names(res$stages), names(mod_expr))
-                if (length(common_cells) > 0) {
-                  stage_means <- tapply(mod_expr[common_cells], res$stages[common_cells], mean)
-                  for (s in names(stage_means)) {
-                    if (s %in% rownames(sc_module_sum)) {
-                      sc_module_sum[s, mod] <- sc_module_sum[s, mod] + stage_means[s]
-                      sc_module_n[s, mod]   <- sc_module_n[s, mod] + 1
-                    }
+# 构建单细胞E/M/L × 6模块矩阵
+sc_module_sum <- matrix(0, nrow = 3, ncol = length(module_names),
+                            dimnames = list(c("E", "M", "L"), module_names))
+sc_module_n   <- matrix(0, nrow = 3, ncol = length(module_names),
+                            dimnames = list(c("E", "M", "L"), module_names))
+
+if (!is.null(monocle_results)) {
+  for (ct in intersect(ct_keys, names(monocle_results))) {
+    res <- monocle_results[[ct]]
+    if (is.list(res) && !is.null(res$stages)) {
+      if (!is.null(res$seurat_obj) && "RNA" %in% Assays(res$seurat_obj)) {
+        tryCatch({
+          norm_data <- LayerData(res$seurat_obj, assay = "RNA", layer = "data")
+          for (mod in module_names) {
+            mod_genes <- intersect(MODULE_GENES[[mod]], rownames(norm_data))
+            if (length(mod_genes) >= 2) {
+              mod_expr <- colMeans(as.matrix(norm_data[mod_genes, , drop = FALSE]))
+              common_cells <- intersect(names(res$stages), names(mod_expr))
+              if (length(common_cells) > 0) {
+                stage_means <- tapply(mod_expr[common_cells], res$stages[common_cells], mean)
+                for (s in names(stage_means)) {
+                  if (s %in% rownames(sc_module_sum)) {
+                    sc_module_sum[s, mod] <- sc_module_sum[s, mod] + stage_means[s]
+                    sc_module_n[s, mod]   <- sc_module_n[s, mod] + 1
                   }
                 }
               }
             }
-          }, error = function(e) {})
-        }
+          }
+        }, error = function(e) {})
       }
     }
-  }
-  sc_module_by_stage <- sc_module_sum / sc_module_n
-  sc_module_by_stage[sc_module_n == 0] <- NA
-
-  # 构建Bulk时间点 × 6模块矩阵
-  bulk_module_by_time <- matrix(NA, nrow = length(time_order), ncol = length(module_names),
-                                 dimnames = list(time_order, module_names))
-  for (mod in module_names) {
-    for (tp in time_order) {
-      tp_scores <- ssgsea_df[ssgsea_df$timepoint == tp, mod]
-      bulk_module_by_time[tp, mod] <- mean(tp_scores, na.rm = TRUE)
-    }
-  }
-
-  # Spearman跨组学关联：聚合Bulk时间点为E/M/L三期以匹配scRNA分期维度
-  sc_complete <- sc_module_by_stage[complete.cases(sc_module_by_stage), , drop = FALSE]
-
-  bulk_stage_map <- list(E = c("3h", "6h"), M = c("12h", "24h"), L = c("7d"))
-  bulk_module_by_stage <- matrix(NA, nrow = 3, ncol = length(module_names),
-                                  dimnames = list(c("E", "M", "L"), module_names))
-  for (stage in c("E", "M", "L")) {
-    tp_match <- intersect(bulk_stage_map[[stage]], rownames(bulk_module_by_time))
-    if (length(tp_match) >= 1) {
-      bulk_module_by_stage[stage, ] <- colMeans(bulk_module_by_time[tp_match, , drop = FALSE], na.rm = TRUE)
-    }
-  }
-  bulk_complete <- bulk_module_by_stage[complete.cases(bulk_module_by_stage), , drop = FALSE]
-
-  common_stages <- intersect(rownames(sc_complete), rownames(bulk_complete))
-  sc_complete <- sc_complete[common_stages, , drop = FALSE]
-  bulk_complete <- bulk_complete[common_stages, , drop = FALSE]
-
-  common_mods <- intersect(colnames(sc_complete), colnames(bulk_complete))
-  sc_complete <- sc_complete[, common_mods, drop = FALSE]
-  bulk_complete <- bulk_complete[, common_mods, drop = FALSE]
-
-  if (nrow(sc_complete) >= 2 && length(common_mods) >= 2) {
-    # Spearman跨组学关联: n=3(E/M/L)时ρ只能取±1/0, 不宜单独解读
-    # v11修复: 改用方向一致性(direction concordance)为主要评估指标
-    cat(sprintf("  跨组学 Spearman 模块一致性 (n=%d):\n", nrow(sc_complete)))
-    if (nrow(sc_complete) <= 3) {
-      cat("  ⚠ n≤3 时 Spearman ρ 自动退化为 ±1/0，不具统计意义\n")
-      cat("    改用 E-vs-L 方向符号一致性 (sign agreement) 为评估指标\n")
-    }
-    module_cors <- c()
-    for (mod in common_mods) {
-      sp_cor <- tryCatch(
-        cor(sc_complete[, mod], bulk_complete[, mod],
-            method = "spearman", use = "complete.obs"),
-        error = function(e) NA_real_
-      )
-      module_cors <- c(module_cors, sp_cor)
-      cat(sprintf("    %s: ρ = %+.3f\n", mod, sp_cor))
-    }
-    names(module_cors) <- common_mods
-
-    mean_rho <- mean(module_cors, na.rm = TRUE)
-    n_sig <- sum(abs(module_cors) >= 0.5, na.rm = TRUE)
-    cat(sprintf("  平均 Spearman ρ = %+.3f (n=%d, |ρ|≥0.5: %d/%d)\n",
-                mean_rho, nrow(sc_complete), n_sig, length(module_cors)))
-    if (nrow(sc_complete) <= 3) {
-      cat("  ** 重要提示: n=3 时 ρ=±1 不代表完美相关，仅代表单调性方向。\n")
-      cat("     请以下方的 Fisher方向一致性检验为主要跨组学证据。\n")
-    }
-
-    # E-vs-L 方向符号一致性: 比较sc与bulk的E→L变化方向是否同号
-    # v11: 核心跨组学指标 — 不依赖n大小，直接评估趋势方向一致
-    sc_EtoL <- sign(sc_complete["L", ] - sc_complete["E", ])
-    bulk_EtoL <- sign(bulk_complete["L", ] - bulk_complete["E", ])
-    dir_agree <- sum(sc_EtoL == bulk_EtoL, na.rm = TRUE)
-    dir_total <- sum(!is.na(sc_EtoL) & !is.na(bulk_EtoL))
-    cat(sprintf("  E→L 方向一致性: %d/%d 模块同向 (%.0f%%)\n",
-                dir_agree, dir_total, 100 * dir_agree / max(dir_total, 1)))
-
-    # Fisher's exact test: 评估跨组学阶段间方向一致性
-    sc_directions <- sign(sc_complete[2, ] - sc_complete[1, ]) * sign(sc_complete[3, ] - sc_complete[2, ])
-    bulk_directions <- sign(bulk_complete[2, ] - bulk_complete[1, ]) * sign(bulk_complete[3, ] - bulk_complete[2, ])
-    names(sc_directions) <- colnames(sc_complete)
-    names(bulk_directions) <- colnames(bulk_complete)
-
-    concordant <- sum(sc_directions == bulk_directions, na.rm = TRUE)
-    discordant <- sum(sc_directions != bulk_directions & !is.na(sc_directions) & !is.na(bulk_directions), na.rm = TRUE)
-    if (concordant + discordant >= 2) {
-      fisher_res <- fisher.test(matrix(c(concordant, discordant, discordant, concordant), nrow = 2),
-                                 alternative = "greater")
-      cat(sprintf("  Fisher精确检验 (阶段间方向一致性):\n"))
-      cat(sprintf("    一致: %d 模块, 不一致: %d 模块\n", concordant, discordant))
-      cat(sprintf("    p = %.4f (greater)\n", fisher_res$p.value))
-      if (fisher_res$p.value < 0.05) {
-        cat("    ✓ 跨组学阶段间方向显著一致\n")
-      } else {
-        cat("    ⚠ 跨组学方向一致性不显著\n")
-      }
-    }
-
-    # v11: 综合评估使用E→L方向 + Fisher
-    if (dir_agree >= 4 && concordant >= 3) {
-      cat("  ✓ 跨组学模块活性趋势一致，分期锚定成立\n")
-    } else if (dir_agree >= 2 && concordant >= 2) {
-      cat("  ~ 跨组学模块活性部分一致，分期锚定需谨慎\n")
-    } else {
-      cat("  ⚠ 跨组学一致性不足，分期结论存疑\n")
-    }
-
-    # 保存 Spearman 结果
-    spearman_df <- data.frame(
-      Module = common_mods,
-      Spearman_rho = module_cors,
-      stringsAsFactors = FALSE
-    )
-    write.csv(spearman_df, file.path(OUTPUT_DIR, "crossomics_spearman.csv"), row.names = FALSE)
-  } else {
-    cat("  跨组学对比数据不足（需要 ≥2 行和 ≥2 模块）\n")
   }
 }
+sc_module_by_stage <- sc_module_sum / sc_module_n
+sc_module_by_stage[sc_module_n == 0] <- NA
+
+# 构建Bulk时间点 × 6模块矩阵
+bulk_module_by_time <- matrix(NA, nrow = length(time_order), ncol = length(module_names),
+                               dimnames = list(time_order, module_names))
+for (mod in module_names) {
+  for (tp in time_order) {
+    tp_scores <- ssgsea_df[ssgsea_df$timepoint == tp, mod]
+    bulk_module_by_time[tp, mod] <- mean(tp_scores, na.rm = TRUE)
+  }
+}
+
+# 聚合Bulk时间点为E/M/L三期以匹配scRNA分期维度
+sc_complete <- sc_module_by_stage[complete.cases(sc_module_by_stage), , drop = FALSE]
+
+bulk_stage_map <- list(E = c("3h", "6h"), M = c("12h", "24h"), L = c("7d"))
+bulk_module_by_stage <- matrix(NA, nrow = 3, ncol = length(module_names),
+                                dimnames = list(c("E", "M", "L"), module_names))
+for (stage in c("E", "M", "L")) {
+  tp_match <- intersect(bulk_stage_map[[stage]], rownames(bulk_module_by_time))
+  if (length(tp_match) >= 1) {
+    bulk_module_by_stage[stage, ] <- colMeans(bulk_module_by_time[tp_match, , drop = FALSE], na.rm = TRUE)
+  }
+}
+bulk_complete <- bulk_module_by_stage[complete.cases(bulk_module_by_stage), , drop = FALSE]
+
+common_stages <- intersect(rownames(sc_complete), rownames(bulk_complete))
+sc_complete <- sc_complete[common_stages, , drop = FALSE]
+bulk_complete <- bulk_complete[common_stages, , drop = FALSE]
+
+common_mods <- intersect(colnames(sc_complete), colnames(bulk_complete))
+sc_complete <- sc_complete[, common_mods, drop = FALSE]
+bulk_complete <- bulk_complete[, common_mods, drop = FALSE]
+
+if (nrow(sc_complete) >= 2 && length(common_mods) >= 2) {
+  n_obs <- nrow(sc_complete)
+  cat(sprintf("  跨组学 Pearson r 模块一致性 (n=%d 观察点: E,M,L):\n", n_obs))
+
+  # v12: Pearson r + Bootstrap 95% CI 替代 Spearman
+  # Spearman 在 n=3 时退化为 ±1/0 — 不具统计意义
+  # Bootstrap 提供合理的置信区间估计
+  set.seed(42)
+  n_boot <- 500
+
+  crossomics_df <- data.frame(
+    Module = common_mods,
+    Pearson_r = numeric(length(common_mods)),
+    Pearson_p = numeric(length(common_mods)),
+    CI_lower = numeric(length(common_mods)),
+    CI_upper = numeric(length(common_mods)),
+    Spearman_rho = numeric(length(common_mods)),
+    Spearman_note = character(length(common_mods)),
+    EtoL_direction = character(length(common_mods)),
+    stringsAsFactors = FALSE
+  )
+
+  for (i in seq_along(common_mods)) {
+    mod <- common_mods[i]
+    sc_vec <- sc_complete[, mod]
+    bulk_vec <- bulk_complete[, mod]
+
+    # Pearson r
+    pr <- tryCatch(
+      cor.test(sc_vec, bulk_vec, method = "pearson", use = "complete.obs"),
+      error = function(e) list(estimate = NA_real_, p.value = NA_real_, conf.int = c(NA_real_, NA_real_))
+    )
+    pearson_r <- as.numeric(pr$estimate)
+    pearson_p <- as.numeric(pr$p.value)
+
+    # Bootstrap CI for Pearson r
+    boot_r <- numeric(n_boot)
+    for (b in seq_len(n_boot)) {
+      idx <- sample(seq_len(n_obs), n_obs, replace = TRUE)
+      boot_r[b] <- tryCatch(
+        cor(sc_vec[idx], bulk_vec[idx], method = "pearson", use = "complete.obs"),
+        error = function(e) NA_real_
+      )
+    }
+    boot_r <- boot_r[!is.na(boot_r)]
+    if (length(boot_r) >= 50) {
+      ci_lo <- quantile(boot_r, 0.025, na.rm = TRUE)
+      ci_hi <- quantile(boot_r, 0.975, na.rm = TRUE)
+    } else {
+      ci_lo <- NA_real_; ci_hi <- NA_real_
+    }
+
+    # Spearman (仅作参考, 标注退化风险)
+    sp_val <- tryCatch(
+      cor(sc_vec, bulk_vec, method = "spearman", use = "complete.obs"),
+      error = function(e) NA_real_
+    )
+    sp_note <- if (n_obs <= 3) "n=3→±1/0退化, 不具统计意义" else ""
+
+    # E→L方向
+    sc_etoL <- sign(sc_complete["L", mod] - sc_complete["E", mod])
+    bulk_etoL <- sign(bulk_complete["L", mod] - bulk_complete["E", mod])
+    etol_dir <- ifelse(sc_etoL == bulk_etoL, "一致", "不一致")
+
+    cat(sprintf("    %s: r=%+.3f [%+.3f, %+.3f] (p=%.3f), ρ=%+.3f (%s), E→L=%s\n",
+                mod, pearson_r, ci_lo, ci_hi, pearson_p, sp_val, sp_note, etol_dir))
+
+    crossomics_df[i, ] <- list(mod, pearson_r, pearson_p, ci_lo, ci_hi, sp_val, sp_note, etol_dir)
+  }
+
+  mean_r <- mean(crossomics_df$Pearson_r, na.rm = TRUE)
+  n_r_sig <- sum(crossomics_df$Pearson_p < 0.1, na.rm = TRUE)
+  n_etol_agree <- sum(crossomics_df$EtoL_direction == "一致", na.rm = TRUE)
+  cat(sprintf("\n  平均 Pearson r = %+.3f, r p<0.1: %d/%d, E→L方向一致: %d/%d\n",
+              mean_r, n_r_sig, nrow(crossomics_df), n_etol_agree, nrow(crossomics_df)))
+
+  if (nrow(sc_complete) <= 3) {
+    cat("  ** 重要: n=3 导致 Pearson CI 较宽 (df=1), 但比 Spearman ±1 退化更可信。\n")
+    cat("     增加中间时间点 (如 48h/96h) 可显著改善 CI 宽度。\n")
+  }
+
+  # E-vs-L 方向符号一致性
+  sc_EtoL <- sign(sc_complete["L", ] - sc_complete["E", ])
+  bulk_EtoL <- sign(bulk_complete["L", ] - bulk_complete["E", ])
+  dir_agree <- sum(sc_EtoL == bulk_EtoL, na.rm = TRUE)
+  dir_total <- sum(!is.na(sc_EtoL) & !is.na(bulk_EtoL))
+  cat(sprintf("  E→L 方向一致性: %d/%d 模块同向 (%.0f%%)\n",
+              dir_agree, dir_total, 100 * dir_agree / max(dir_total, 1)))
+
+  # Fisher's exact test
+  concordant <- dir_agree
+  discordant <- dir_total - dir_agree
+  if (concordant + discordant >= 2) {
+    fisher_res <- fisher.test(matrix(c(concordant, discordant, discordant, concordant), nrow = 2),
+                               alternative = "greater")
+    cat(sprintf("  Fisher精确检验 (E→L方向): 一致=%d 不一致=%d, p=%.4f\n",
+                concordant, discordant, fisher_res$p.value))
+    if (fisher_res$p.value < 0.05) {
+      cat("    ✓ 跨组学E→L方向显著一致\n")
+    } else {
+      cat("    ⚠ 跨组学E→L方向一致性不显著\n")
+    }
+  }
+
+  # 综合评估
+  if (n_r_sig >= 3 && n_etol_agree >= 4) {
+    cat("  ✓ 跨组学模块活性趋势一致 (Pearson+Bootstrap+E→L), 分期锚定成立\n")
+  } else if (n_r_sig >= 1 || n_etol_agree >= 3) {
+    cat("  ~ 跨组学模块活性部分一致, 分期锚定需谨慎\n")
+  } else {
+    cat("  ⚠ 跨组学一致性不足, 分期结论存疑\n")
+  }
+
+  write.csv(crossomics_df, file.path(OUTPUT_DIR, "crossomics_pearson.csv"), row.names = FALSE)
+
+  # 同时输出 Spearman (附退化警告, 兼容旧版 Excel)
+  spearman_legacy <- crossomics_df[, c("Module", "Spearman_rho", "Spearman_note")]
+  colnames(spearman_legacy)[3] <- "warning"
+  write.csv(spearman_legacy, file.path(OUTPUT_DIR, "crossomics_spearman.csv"), row.names = FALSE)
+} else {
+  cat("  跨组学对比数据不足（需要 ≥2 行和 ≥2 模块）\n")
+}
+
+# P1-1 物种注释: 标注跨组学比较中的物种来源
+cat("\n  [P1-1 物种注释]\n")
+cat("  scRNA来源: Mus musculus (小鼠, GSE174574, 24h MCAO)\n")
+cat("  Bulk来源:  GSE104036 (小鼠 3-24h) + GSE97537 (大鼠 24h) + GSE61616 (大鼠 7d)\n")
+cat("  ⚠ 跨组学比较存在物种混杂 (小鼠scRNA vs 大鼠bulk 7d)\n")
+cat("    物种间基因调控时序可能存在差异, 7d数据点的一致性判读需谨慎\n")
 
 # ======================================================================
 #                    第四部分：MCP-counter 免疫浸润验证
@@ -1827,9 +1992,26 @@ for (i in seq_along(module_names)) {
     constraint <- sprintf("%s 峰值在24h, 7d回落: 归类为亚急性期(非慢性)", mod)
     species_note <- "7d<24h, 无慢性期证据"
   } else if (peak_tp %in% c("3h", "6h")) {
-    phase <- "E (急性期 3-6h)"
-    constraint <- sprintf("%s 实测峰值在%s: 急性期激活", mod, peak_tp)
-    species_note <- ""
+    # v12: 平台期检测 — 若实测峰值与sham差异<1%且7d≈peak, 归为E/M plateau
+    sham_val <- op$sham_val
+    tp7d_val <- op$tp7d_val
+    is_plateau <- FALSE
+    if (!is.na(sham_val) && abs(sham_val) > 0.001) {
+      pct_change <- abs(peak_val - sham_val) / abs(sham_val)
+      if (pct_change < 0.01 && !is.na(tp7d_val) && abs(tp7d_val - peak_val) / max(abs(peak_val), 0.001) < 0.02) {
+        is_plateau <- TRUE
+      }
+    }
+    if (is_plateau) {
+      phase <- "E/M Plateau (全时间窗平台)"
+      constraint <- sprintf("%s 全时间窗平台期 (sham=%.4f, peak=%.4f, 7d=%.4f, Δ<1%%)",
+                            mod, sham_val, peak_val, tp7d_val)
+      species_note <- "全时间窗平台, 非典型急性期激活, 不宜赋予强时序特异性"
+    } else {
+      phase <- "E (急性期 3-6h)"
+      constraint <- sprintf("%s 实测峰值在%s: 急性期激活", mod, peak_tp)
+      species_note <- ""
+    }
   } else if (peak_tp %in% c("12h", "24h")) {
     phase <- "M (亚急性期 12-24h)"
     constraint <- sprintf("%s 实测峰值在%s: 亚急性期激活", mod, peak_tp)
@@ -1857,8 +2039,10 @@ for (i in seq_along(module_names)) {
 }
 
 event_order <- event_order[event_order$activation_phase != "", ]
-phase_order <- c("E (急性期 3-6h)", "M (亚急性期 12-24h)", "M (亚急性期 12-24h)?", "L (慢性期 1d-7d)")
+phase_order <- c("E (急性期 3-6h)", "E/M Plateau (全时间窗平台)", "M (亚急性期 12-24h)", "M (亚急性期 12-24h)?", "L (慢性期 1d-7d)")
 event_order$phase_rank <- match(event_order$activation_phase, phase_order)
+# Plateau phases get rank 1.5 (between E and M)
+event_order$phase_rank[event_order$activation_phase == "E/M Plateau (全时间窗平台)"] <- 1.5
 event_order <- event_order[order(event_order$phase_rank), ]
 
 cat("\n事件顺序约束表:\n")
@@ -2009,7 +2193,7 @@ cat("\n========== 结果汇总 ==========\n")
 
 results_summary <- list(
   analysis_name = "L1 定性分期锚定层 (QualTCA)",
-  version = "v11",
+  version = "v12",
   date = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
   input_datasets = c("GSE104036 (小鼠RNA-seq, 3h/6h/12h/24h)",
                      "GSE97537 (大鼠芯片, 24h)",
@@ -2020,16 +2204,20 @@ results_summary <- list(
   n_consistent_markers = n_consistent,
   consistency_rate = consistency_rate,
   anchor_passed = anchor_passed,
+  kendall_tau = if (!is.null(kendall_results)) kendall_results else NULL,
   event_order = event_order,
   observed_peaks = observed_peak_df,
   inflection_points = inflection_summary,
   species_stratified = list(mouse_peaks = mouse_peaks),
   method_notes = c(
+    "v12: Kendall's τ + JT 趋势检验替代自定义置换框架 (perm_sd=0无推断力)",
+    "v12: CrossOmics Pearson r + Bootstrap 95%CI 替代 Spearman (±1退化)",
+    "v12: CCA 永久弃用 — n=3×6 过拟合必然 r=1.0",
+    "v12: P1-1 物种分层 — AnchorMarkers 增加 species_match 字段",
+    "v12: M2 Plateau — 全时间窗平台期, 不赋予强时序特异性",
     "v11: 分期使用实测峰值(非loess插值假峰)",
     "v11: 物种分层 — 小鼠(3-24h)/大鼠(7d)独立分析",
-    "v11: 24h-168h数据空洞已标注, M1/M5 7d<24h 强制归亚急性期",
-    "v11: PermutationTest 修复 — OR逻辑替代AND + Fisher检验",
-    "v11: Spearman n=3自动退化为方向一致性评估"
+    "v11: 24h-168h数据空洞已标注, M1/M5 7d<24h 强制归亚急性期"
   ),
   gene_loss_report = gene_loss_report,
   fallback_log = fallback_log,

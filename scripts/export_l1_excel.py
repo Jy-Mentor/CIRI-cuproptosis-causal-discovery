@@ -82,10 +82,12 @@ csvs = {
     "SmoothedCurves": safe_read(CSV_DIR / "smoothed_curves.csv"),
     "EventOrder": safe_read(CSV_DIR / "event_order_constraints.csv"),
     "MCPcounter": safe_read(CSV_DIR / "mcpcounter_cell_scores.csv"),
-    "PermutationTest": safe_read(CSV_DIR / "permutation_test_markers.csv"),
-    "CrossOmics": safe_read(CSV_DIR / "crossomics_spearman.csv"),
-    "CCA": safe_read(CSV_DIR / "cca_results.csv"),
+    "KendallTau": safe_read(CSV_DIR / "kendall_tau_test.csv"),
+    "CrossOmicsPearson": safe_read(CSV_DIR / "crossomics_pearson.csv"),
+    "CrossOmicsSpearman": safe_read(CSV_DIR / "crossomics_spearman.csv"),
+    "CCA_Deprecated": safe_read(CSV_DIR / "cca_results.csv"),
     "ObservedPeaks": safe_read(CSV_DIR / "observed_peaks.csv"),
+    "PermutationTest": safe_read(CSV_DIR / "permutation_test_markers.csv"),
 }
 
 # ── Create workbook ──
@@ -97,7 +99,7 @@ ws_summary.sheet_properties.tabColor = "1F4E79"
 r = 1
 ws_summary.cell(row=r, column=1, value="L1 QualTCA — 定性分期锚定结果汇总").font = TITLE_FONT
 r += 2
-ws_summary.cell(row=r, column=1, value="版本: v11 — 方法学硬伤修复版（置换检验/插值假峰/物种分层/分期修正）").font = SECTION_FONT
+ws_summary.cell(row=r, column=1, value="版本: v12 — 真正修复版（Kendall τ 趋势检验/Pearson+Bootstrap CI/物种分层/M2平台期）").font = SECTION_FONT
 r += 2
 
 # Run info
@@ -107,7 +109,7 @@ info = [
     ("完成时间", "2026-05-28 00:30"),
     ("输入数据集", "GSE104036 (小鼠RNA-seq, 3h/6h/12h/24h), GSE97537 (大鼠芯片, 24h), GSE61616 (大鼠芯片, 7d), GSE174574 (小鼠scRNA-seq, 24h)"),
     ("分析模块 (CEHG-RNP 3.2)", "M1_CopperTransport, M2_Lipoylation_TCA, M3_FeS_Cluster, M4_OxidativeStress, M5_Energy_Mito, M6_UPR"),
-    ("v11 修复项", "P0-1: 置换检验&→|, P0-2: Spearman退化±1/0警告, P0-3: 删除24h-168h插值假峰, P1-1: 物种分层, P1-2: M1/M5 7d<24h→M期"),
+    ("v12 修复项", "P0-1: 废除置换框架→Kendall τ趋势检验, P0-2: Spearman退化→Pearson+Bootstrap CI, CCA永久弃用, P1-1: 真正物种分层字段, M2: 全时间窗平台期标注"),
 ]
 for label, val in info:
     ws_summary.cell(row=r, column=1, value=label).font = Font(bold=True, size=11)
@@ -193,12 +195,16 @@ write_sheet(wb, "自检详情", pd.DataFrame({
 }))
 
 for name in ["AnchorMarkers", "ModuleTimepoint", "ssGSEA_Scores", "InflectionPoints",
-             "SmoothedCurves", "EventOrder", "ObservedPeaks", "MCPcounter", "CrossOmics", "CCA"]:
+             "SmoothedCurves", "EventOrder", "ObservedPeaks", "MCPcounter",
+             "KendallTau", "CrossOmicsPearson", "CrossOmicsSpearman", "CCA_Deprecated"]:
     ws = write_sheet(wb, name, csvs[name])
     if name == "AnchorMarkers": ws.sheet_properties.tabColor = "2E75B6"
     elif name == "MCPcounter": ws.sheet_properties.tabColor = "70AD47"
     elif name == "EventOrder": ws.sheet_properties.tabColor = "ED7D31"
     elif name == "ObservedPeaks": ws.sheet_properties.tabColor = "BF8F00"
+    elif name == "KendallTau": ws.sheet_properties.tabColor = "4472C4"
+    elif name == "CrossOmicsPearson": ws.sheet_properties.tabColor = "5B9BD5"
+    elif name == "CCA_Deprecated": ws.sheet_properties.tabColor = "808080"
 
 write_sheet(wb, "PermutationTest", csvs["PermutationTest"])
 
