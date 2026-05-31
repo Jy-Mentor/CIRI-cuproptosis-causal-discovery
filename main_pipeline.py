@@ -217,6 +217,7 @@ def main():
         "stage6_sctenifold_knockout": ["gene_perturbation_scores.csv"],
         "stage7_ml_shap": ["gene_shap_importance.csv", "ml_model_performance.csv"],
         "stage8_final_targets": ["core_targets.csv", "tier1_targets.csv", "final_report.txt"],
+        "brain_coexpression": ["brain_coexpression_features.csv", "feature_dimensions.json"],
     }
 
     for stage_name, required_files in required_files_map.items():

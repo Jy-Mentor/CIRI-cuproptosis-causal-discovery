@@ -243,7 +243,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
 torch.manual_seed(ML_RANDOM_STATE)
 if torch.cuda.is_available():
@@ -375,6 +375,7 @@ PIPELINE_OUTPUT_VALIDATION = {
     "stage6_sctenifold_knockout": ["gene_perturbation_scores.csv"],
     "stage7_ml_shap": ["gene_shap_importance.csv", "ml_model_performance.csv"],
     "stage8_final_targets": ["core_targets.csv", "tier1_targets.csv", "final_report.txt"],
+    "brain_coexpression": ["brain_coexpression_features.csv", "feature_dimensions.json"],
 }
 
 # ============================================================
@@ -387,4 +388,42 @@ MCP_EXCEL_ENABLED = False
 MCP_PROTEIN_SEQUENCES = {}
 MCP_GITHUB_REPO = {"owner": "", "repo": ""}
 MCP_EXCEL_TEMPLATE = ""
+
+# ============================================================
+# 11. Brain Co-expression Configuration (v1.0 - 路线一)
+# 基于成品脑组织数据库的共表达特征整合
+# ============================================================
+BRAIN_COEXPRESSION_DIR = os.path.join(RESULTS_DIR, "brain_coexpression")
+BRAIN_COEXPRESSION_ENABLED = True
+
+# PsychENCODE WGCNA 模块数据
+PSYCHENCODE_WGCNA_URL = (
+    "http://resource.psychencode.org/Datasets/Integrative/ModelParams"
+    "/INT-09_WGCNA_modules_hgnc_ids.xlsx"
+)
+
+# Harmonizome Allen Brain Atlas (发育中人脑 RNA-seq)
+HARMONIZOME_BRAIN_ATLAS_BASE = (
+    "https://maayanlab.cloud/static/hdfs/harmonizome/data"
+    "/brainatlasdevelopmentalhumanrnaseq"
+)
+
+HARMONIZOME_FILES = {
+    "gene_attr_matrix_cleaned": "gene_attribute_matrix_cleaned.txt.gz",
+    "gene_attr_matrix_standardized": "gene_attribute_matrix_standardized.txt.gz",
+    "gene_similarity_cosine": "gene_similarity_matrix_cosine.txt.gz",
+    "attribute_list": "attribute_list_entries.txt.gz",
+    "gene_list": "gene_list_terms.txt.gz",
+}
+
+# 脑共表达特征阶段输出
+STAGE_OUTPUTS['brain_coexpression'] = {
+    'brain_coexpression_features': 'brain_coexpression_features.csv',
+    'brain_coexpression_features_npy': 'brain_coexpression_features.npy',
+    'brain_module_assignments': 'brain_module_assignments.csv',
+    'gene_pair_coexpression': 'gene_pair_coexpression.csv',
+    'brain_region_profiles': 'brain_region_profiles.csv',
+}
+
+print(f"Brain coexpression: {'Enabled' if BRAIN_COEXPRESSION_ENABLED else 'Disabled'}")
 

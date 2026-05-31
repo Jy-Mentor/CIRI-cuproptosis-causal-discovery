@@ -83,3 +83,9 @@ disease_genes_for_GAT.csv
 common_DEGs.csv
 union_DEGs.csv
 deg_temporal_summary.xlsx
+# Brain coexpression cache
+results/brain_coexpression/cache/
+results/brain_coexpression/*.csv
+results/brain_coexpression/*.npy
+results/brain_coexpression/*.json
+results/brain_coexpression/*.log
