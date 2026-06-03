@@ -514,9 +514,10 @@ def train_single_model(model_name, fe_builder, clf_builder, X_base, y,
     返回:
       (model_name, probas, {'auroc': ..., 'auprc': ...})
     """
-    # 各 worker 进程内禁用 ConvergenceWarning (joblib 不继承主进程 filter)
+    # 各 worker 进程内禁用不必要的警告 (joblib 不继承主进程 filter)
     warnings.filterwarnings("ignore", category=ConvergenceWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
     seed = SEED + model_idx
     n_genes = X_base.shape[0]
