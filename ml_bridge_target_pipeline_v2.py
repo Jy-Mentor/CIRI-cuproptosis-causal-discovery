@@ -220,10 +220,9 @@ def clf_rf():
         random_state=SEED, n_jobs=-1)
 
 def clf_gb():
-    """GradientBoostingClassifier — class_weight='balanced' 处理样本不平衡"""
+    """GradientBoostingClassifier — 通过 sample_weight 处理不平衡"""
     return GradientBoostingClassifier(
-        n_estimators=100, learning_rate=0.1,
-        class_weight='balanced', random_state=SEED)
+        n_estimators=100, learning_rate=0.1, random_state=SEED)
 
 def clf_xgb():
     import xgboost as xgb
@@ -378,7 +377,19 @@ def run_cv_for_task(X_base, y, gene_index, model_combos, task_name, unknown_mask
             # --- 3. 训练分类器 ---
             try:
                 clf = clf_builder()
-                clf.fit(X_train_fe, y_train)
+                # GradientBoostingClassifier 不支持 class_weight 参数
+                # 通过 sample_weight 实现类别平衡
+                if isinstance(clf, GradientBoostingClassifier):
+                    n_pos = y_train.sum()
+                    n_neg = len(y_train) - n_pos
+                    sample_weight = np.where(
+                        y_train == 1,
+                        len(y_train) / (2 * max(n_pos, 1)),
+                        len(y_train) / (2 * max(n_neg, 1))
+                    )
+                    clf.fit(X_train_fe, y_train, sample_weight=sample_weight)
+                else:
+                    clf.fit(X_train_fe, y_train)
             except Exception as e:
                 log(f"    [SKIP] Fold {fold+1}: 分类器 fit 失败: {e}")
                 continue
@@ -628,8 +639,8 @@ def main():
             try:
                 fe_name, clf_name = best_model_name.split("__", 1)
                 y_task = y_dt if task_name == 'DT' else y_dg
-                labeled = y_task != 0
-                X_lbl, y_lbl = X[labeled], y_task[labeled]
+                # 使用所有有标签数据 (正+负) 训练特征重要性模型
+                X_lbl, y_lbl = X, y_task
 
                 if len(np.unique(y_lbl)) < 2:
                     continue
@@ -657,7 +668,18 @@ def main():
                     X_fe = X_s
 
                 clf = clf_builder()
-                clf.fit(X_fe, y_lbl)
+                # GB 不支持 class_weight, 使用 sample_weight
+                if isinstance(clf, GradientBoostingClassifier):
+                    n_pos = y_lbl.sum()
+                    n_neg = len(y_lbl) - n_pos
+                    sw = np.where(
+                        y_lbl == 1,
+                        len(y_lbl) / (2 * max(n_pos, 1)),
+                        len(y_lbl) / (2 * max(n_neg, 1))
+                    )
+                    clf.fit(X_fe, y_lbl, sample_weight=sw)
+                else:
+                    clf.fit(X_fe, y_lbl)
 
                 # For raw features, extract importance on original feature names
                 if fe_name == "raw":
