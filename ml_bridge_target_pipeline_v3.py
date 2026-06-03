@@ -8,8 +8,8 @@
   1. GPU 加速: XGBoost (gpu_hist) + LightGBM (device='gpu')
   2. 多进程并行: joblib.Parallel 替代串行模型循环
   3. 特征工程扩展: PCA变体(20/30/80/100) + Lasso变体(20/30/80) + PLS变体(5/15) + KBest
-  4. 分类器扩展: NB / LDA / SVC / KNN / ExtraTrees / PassiveAggressive
-  5. 预期组合: 13种特征工程 × 13种分类器 = 169种模型 (~论文级113+)
+  4. 分类器扩展: NB / SVC / ExtraTrees / PassiveAggressive
+  5. 预期组合: 16种特征工程 × 11~13种分类器 = 176~208种模型
 
 防泄漏设计:
   - train_single_model 完全自包含: 内部实例化 scaler / 特征工程 / 分类器
@@ -20,7 +20,7 @@ v3.0 新增:
   - [NEW] 多进程并行: joblib.Parallel(n_jobs=-1) 加速模型训练
   - [NEW] GPU 支持: XGBoost gpu_hist / LightGBM device=gpu (自动回退CPU)
   - [NEW] 特征工程扩展: 8种新增策略 (PCA 20/30/80/100, Lasso 20/30/80, PLS 5/15, KBest)
-  - [NEW] 分类器扩展: 6种新增算法 (GaussianNB, LDA, SVC, KNN, ExtraTrees, PAC)
+  - [NEW] 分类器扩展: 4种新增算法 (GaussianNB, SVC, ExtraTrees, PAC) [LDA移除: 协方差奇异; KNN移除: 高维失效]
   - [NEW] sample_weight 统一处理: 所有不支持 class_weight 的分类器自动使用 sample_weight
 """
 
@@ -43,7 +43,7 @@ from sklearn.cross_decomposition import PLSRegression
 from sklearn.feature_selection import SelectFromModel, SelectKBest, f_classif
 from sklearn.naive_bayes import GaussianNB
 from sklearn.svm import SVC
-from sklearn.neighbors import KNeighborsClassifier
+
 from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.stats import spearmanr
 
@@ -443,11 +443,6 @@ def clf_svc():
                    random_state=SEED, max_iter=5000, probability=False)
     return CalibratedClassifierCV(base_svc, cv=3, method='sigmoid')
 
-def clf_knn():
-    """K 最近邻 — metric='cosine' 缓解高维距离度量失效"""
-    return KNeighborsClassifier(n_neighbors=7, weights='distance',
-                                metric='cosine', n_jobs=1)
-
 def clf_extratrees():
     """极端随机树 — 类似 RF 但随机性更强"""
     return ExtraTreesClassifier(
@@ -469,7 +464,6 @@ CLF_MAP = {
     "GB":           clf_gb,
     "NB":           clf_nb,
     "SVC":          clf_svc,
-    "KNN":          clf_knn,
     "ExtraTrees":   clf_extratrees,
     "PAC":          clf_pac,
 }
@@ -492,8 +486,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 # 不需要 class_weight 的分类器集合 (需要 sample_weight)
 # ═══════════════════════════════════════════════════════════════════════════════
-NO_CLASS_WEIGHT_CLFS = {GradientBoostingClassifier, GaussianNB,
-                        KNeighborsClassifier}
+NO_CLASS_WEIGHT_CLFS = {GradientBoostingClassifier, GaussianNB}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
