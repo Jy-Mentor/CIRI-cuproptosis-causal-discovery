@@ -403,8 +403,11 @@ def clf_lda():
     return LinearDiscriminantAnalysis()
 
 def clf_svc():
-    """支持向量机 — probability=True 需要更多时间"""
-    return SVC(probability=True, class_weight='balanced', random_state=SEED, max_iter=5000)
+    """SVM + CalibratedClassifierCV (概率标定, 比 SVC(probability=True) 快)"""
+    from sklearn.calibration import CalibratedClassifierCV
+    base_svc = SVC(C=1.0, kernel='rbf', class_weight='balanced',
+                   random_state=SEED, max_iter=5000, probability=False)
+    return CalibratedClassifierCV(base_svc, cv=3, method='sigmoid')
 
 def clf_knn():
     """K 最近邻 — weights='distance' 处理不平衡"""
