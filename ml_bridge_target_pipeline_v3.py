@@ -72,9 +72,16 @@ _XGB_GPU_PARAMS = {}
 _XGB_GPU_AVAILABLE = False
 _XGB_GPU_INFO = "未检测"
 
-def detect_gpu_xgb():
-    """一次性检测 XGBoost GPU 可用性, 日志记录设备信息."""
+def detect_gpu_xgb(enabled=True):
+    """一次性检测 XGBoost GPU 可用性, 日志记录设备信息.
+    enabled=False 时跳过检测直接使用 CPU."""
     global _XGB_GPU_PARAMS, _XGB_GPU_AVAILABLE, _XGB_GPU_INFO
+    if not enabled:
+        _XGB_GPU_AVAILABLE = False
+        _XGB_GPU_PARAMS = {'tree_method': 'hist', 'predictor': 'cpu_predictor'}
+        _XGB_GPU_INFO = "显存安全模式: 回退 CPU"
+        log(f"  [GPU] XGBoost: {_XGB_GPU_INFO}")
+        return
     try:
         import xgboost as xgb
         # 先尝试构造 GPU 参数, 用极简数据验证
@@ -109,9 +116,16 @@ _LGB_GPU_PARAMS = {}
 _LGB_GPU_AVAILABLE = False
 _LGB_GPU_INFO = "未检测"
 
-def detect_gpu_lgb():
-    """一次性检测 LightGBM GPU 可用性."""
+def detect_gpu_lgb(enabled=True):
+    """一次性检测 LightGBM GPU 可用性.
+    enabled=False 时跳过检测直接使用 CPU."""
     global _LGB_GPU_PARAMS, _LGB_GPU_AVAILABLE, _LGB_GPU_INFO
+    if not enabled:
+        _LGB_GPU_AVAILABLE = False
+        _LGB_GPU_PARAMS = {}
+        _LGB_GPU_INFO = "显存安全模式: 回退 CPU"
+        log(f"  [GPU] LightGBM: {_LGB_GPU_INFO}")
+        return
     try:
         import lightgbm as lgb
         params = {'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0,
@@ -133,26 +147,48 @@ def detect_gpu_lgb():
 
 # CUDA 环境整体检测
 def detect_gpu_environment():
-    """运行所有 GPU 检测, 打印 CUDA 环境摘要."""
+    """运行所有 GPU 检测, 打印 CUDA 环境摘要. 自动检测显存冲突风险."""
     log("-" * 50)
     log("GPU 环境检测")
     log("-" * 50)
+
+    # 计算有效并行数
+    effective_jobs = os.cpu_count() if N_JOBS == -1 else N_JOBS
+    log(f"  并行核心: {N_JOBS} → 有效 {effective_jobs} 进程")
+
     try:
         import torch
         cuda_avail = torch.cuda.is_available()
         cuda_ver = torch.version.cuda or "N/A"
         n_gpu = torch.cuda.device_count() if cuda_avail else 0
         gpu_name = torch.cuda.get_device_name(0) if cuda_avail and n_gpu > 0 else "N/A"
-        log(f"  PyTorch CUDA: {'可用' if cuda_avail else '不可用'} "
-            f"(v{cuda_ver}, {n_gpu} GPU, {gpu_name})")
+        try:
+            total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+            log(f"  PyTorch CUDA: 可用 ✅ (v{cuda_ver}, {n_gpu}× {gpu_name}, {total_vram:.1f}GB VRAM)")
+        except Exception:
+            log(f"  PyTorch CUDA: 可用 ✅ (v{cuda_ver}, {n_gpu}× {gpu_name})")
     except ImportError:
+        cuda_avail = False
         log(f"  PyTorch CUDA: 未安装")
 
-    if GPU_ENABLED:
-        detect_gpu_xgb()
-        detect_gpu_lgb()
-    else:
+    if not GPU_ENABLED:
         log("  [GPU] GPU_ENABLED=False, 所有模型使用 CPU")
+        return
+
+    # ── 显存安全检测: 多进程 GPU 并发 → OOM 风险 ──
+    gpu_parallel_threshold = 4  # 8GB VRAM 安全阈值
+    if cuda_avail and effective_jobs > gpu_parallel_threshold:
+        log(f"  ⚠️  显存安全模式: N_JOBS={effective_jobs} > {gpu_parallel_threshold}")
+        log(f"     多进程 GPU 并发可能耗尽 {total_vram:.0f}GB VRAM")
+        log(f"     → GPU 模型自动回退 CPU, 纯 CPU 模型仍可 24 进程并行 ✅")
+        _xgb_gpu_safe = False
+        _lgb_gpu_safe = False
+    else:
+        _xgb_gpu_safe = True
+        _lgb_gpu_safe = True
+
+    detect_gpu_xgb(enabled=_xgb_gpu_safe)
+    detect_gpu_lgb(enabled=_lgb_gpu_safe)
 
 # 执行一次性 GPU 检测 (在模块加载时)
 # 注: 调用移到了 log() 定义之后
