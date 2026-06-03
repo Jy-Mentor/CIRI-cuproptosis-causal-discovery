@@ -42,7 +42,6 @@ from sklearn.decomposition import PCA
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.feature_selection import SelectFromModel, SelectKBest, f_classif
 from sklearn.naive_bayes import GaussianNB
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score
@@ -434,9 +433,8 @@ def clf_nb():
     """高斯朴素贝叶斯 — 不支持 class_weight, 通过 prior 调整"""
     return GaussianNB()
 
-def clf_lda():
-    """线性判别分析 — 支持 priors 参数调整类别先验"""
-    return LinearDiscriminantAnalysis()
+# ── 修复: LDA 在小样本高维下协方差奇异, 移除 ──
+# (降维后可用, 但需要单独逻辑, 不值得增加复杂度)
 
 def clf_svc():
     """SVM + CalibratedClassifierCV (概率标定, 比 SVC(probability=True) 快)"""
@@ -446,8 +444,9 @@ def clf_svc():
     return CalibratedClassifierCV(base_svc, cv=3, method='sigmoid')
 
 def clf_knn():
-    """K 最近邻 — weights='distance' 处理不平衡"""
-    return KNeighborsClassifier(n_neighbors=5, weights='distance', n_jobs=1)
+    """K 最近邻 — metric='cosine' 缓解高维距离度量失效"""
+    return KNeighborsClassifier(n_neighbors=7, weights='distance',
+                                metric='cosine', n_jobs=1)
 
 def clf_extratrees():
     """极端随机树 — 类似 RF 但随机性更强"""
@@ -456,9 +455,11 @@ def clf_extratrees():
         random_state=SEED, n_jobs=1)
 
 def clf_pac():
-    """被动攻击分类器 — 在线学习风格"""
-    return PassiveAggressiveClassifier(
+    """被动攻击 + CalibratedClassifierCV (PAC 无 predict_proba)"""
+    from sklearn.calibration import CalibratedClassifierCV
+    base_pac = PassiveAggressiveClassifier(
         C=0.1, class_weight='balanced', max_iter=2000, random_state=SEED)
+    return CalibratedClassifierCV(base_pac, cv=3, method='sigmoid')
 
 CLF_MAP = {
     "L1_LR":        clf_l1_lr,
@@ -467,7 +468,6 @@ CLF_MAP = {
     "RF":           clf_rf,
     "GB":           clf_gb,
     "NB":           clf_nb,
-    "LDA":          clf_lda,
     "SVC":          clf_svc,
     "KNN":          clf_knn,
     "ExtraTrees":   clf_extratrees,
@@ -493,7 +493,7 @@ except ImportError:
 # 不需要 class_weight 的分类器集合 (需要 sample_weight)
 # ═══════════════════════════════════════════════════════════════════════════════
 NO_CLASS_WEIGHT_CLFS = {GradientBoostingClassifier, GaussianNB,
-                        LinearDiscriminantAnalysis, KNeighborsClassifier}
+                        KNeighborsClassifier}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
