@@ -162,113 +162,117 @@ def load_data():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 模块级 Builder 函数 (供 build_model_combinations 和 main 的 STEP 7e 共用)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── 特征工程策略 ──
+def fe_raw():
+    """原始特征 — 不做任何变换"""
+    return None
+
+def fe_pca_10():
+    return PCA(n_components=10, random_state=SEED)
+
+def fe_pca_50():
+    return PCA(n_components=50, random_state=SEED)
+
+def fe_lasso_sel():
+    """LassoCV 特征选择 — 自动选择非零系数特征"""
+    return SelectFromModel(
+        LassoCV(cv=2, n_alphas=20, random_state=SEED, max_iter=2000, n_jobs=-1),
+        max_features=50
+    )
+
+def fe_pls_10():
+    """PLS 偏最小二乘 — 同时利用 X 和 y 的协方差进行降维"""
+    return PLSRegression(n_components=10, scale=False)
+
+FE_MAP = {
+    "raw":       fe_raw,
+    "pca_10":    fe_pca_10,
+    "pca_50":    fe_pca_50,
+    "lasso_sel": fe_lasso_sel,
+    "pls_10":    fe_pls_10,
+}
+
+# 需要 y 的有监督特征工程 (PCA 不需要)
+SUPERVISED_FE = {PLSRegression, SelectFromModel}
+
+# ── 基础分类器 ──
+def clf_l1_lr():
+    return LogisticRegression(
+        penalty='l1', solver='liblinear', C=0.1,
+        class_weight='balanced', max_iter=5000, random_state=SEED)
+
+def clf_l2_lr():
+    return LogisticRegression(
+        penalty='l2', C=1.0,
+        class_weight='balanced', max_iter=5000, random_state=SEED)
+
+def clf_elasticnet_lr():
+    return SGDClassifier(
+        loss='log_loss', penalty='elasticnet', alpha=0.001, l1_ratio=0.5,
+        class_weight='balanced', max_iter=2000, random_state=SEED)
+
+def clf_rf():
+    return RandomForestClassifier(
+        n_estimators=200, class_weight='balanced',
+        random_state=SEED, n_jobs=-1)
+
+def clf_gb():
+    """GradientBoostingClassifier — class_weight='balanced' 处理样本不平衡"""
+    return GradientBoostingClassifier(
+        n_estimators=100, learning_rate=0.1,
+        class_weight='balanced', random_state=SEED)
+
+def clf_xgb():
+    import xgboost as xgb
+    return xgb.XGBClassifier(
+        n_estimators=200, learning_rate=0.1,
+        eval_metric='logloss', random_state=SEED, verbosity=0)
+
+def clf_lgb():
+    import lightgbm as lgb
+    return lgb.LGBMClassifier(
+        n_estimators=200, learning_rate=0.1,
+        class_weight='balanced', random_state=SEED, verbose=-1)
+
+CLF_MAP = {
+    "L1_LR":        clf_l1_lr,
+    "L2_LR":        clf_l2_lr,
+    "ElasticNet_LR": clf_elasticnet_lr,
+    "RF":           clf_rf,
+    "GB":           clf_gb,
+}
+
+# XGBoost (可选)
+try:
+    import xgboost
+    CLF_MAP["XGBoost"] = clf_xgb
+except ImportError:
+    pass
+
+# LightGBM (可选)
+try:
+    import lightgbm
+    CLF_MAP["LightGBM"] = clf_lgb
+except ImportError:
+    pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # STEP 2: 构建特征工程 × 基础分类器的笛卡尔积模型组合
 # ═══════════════════════════════════════════════════════════════════════════════
 def build_model_combinations():
     """
-    返回 list of (model_name, feature_engineering_fn, clf_builder_fn)
-
-    特征工程策略 (5种):
-      raw       → 无变换
-      pca_10    → PCA(10) 
-      pca_50    → PCA(50)
-      lasso_sel → SelectFromModel(LassoCV) ~20-40特征
-      pls_10    → PLSRegression(n_components=10)
-
-    基础分类器 (8种):
-      L1_LR, L2_LR, ElasticNet_LR, RF, XGBoost, LightGBM, SVM_RBF, GradientBoosting
+    返回 (combinations, fe_map, clf_map):
+      - combinations: list of (model_name, fe_builder_fn, clf_builder_fn)
+      - fe_map: {fe_name: fe_builder_fn}
+      - clf_map: {clf_name: clf_builder_fn}
     """
-    # ── 特征工程策略 ──
-    def fe_raw():
-        """原始特征 — 不做任何变换"""
-        return None
+    feature_engineerings = list(FE_MAP.items())
+    classifiers = list(CLF_MAP.items())
 
-    def fe_pca_10():
-        return PCA(n_components=10, random_state=SEED)
-
-    def fe_pca_50():
-        return PCA(n_components=50, random_state=SEED)
-
-    def fe_lasso_sel():
-        """LassoCV 特征选择 — 自动选择非零系数特征"""
-        return SelectFromModel(
-            LassoCV(cv=2, n_alphas=20, random_state=SEED, max_iter=2000, n_jobs=-1),
-            max_features=50  # 上限
-        )
-
-    def fe_pls_10():
-        """PLS 偏最小二乘 — 同时利用 X 和 y 的协方差进行降维"""
-        return PLSRegression(n_components=10, scale=False)
-
-    feature_engineerings = [
-        ("raw",       fe_raw),
-        ("pca_10",    fe_pca_10),
-        ("pca_50",    fe_pca_50),
-        ("lasso_sel", fe_lasso_sel),
-        ("pls_10",    fe_pls_10),
-    ]
-
-    # ── 基础分类器 (使用 builder 函数以避免跨折状态泄漏) ──
-    def clf_l1_lr():
-        return LogisticRegression(
-            penalty='l1', solver='liblinear', C=0.1,
-            class_weight='balanced', max_iter=5000, random_state=SEED)
-
-    def clf_l2_lr():
-        return LogisticRegression(
-            penalty='l2', C=1.0,
-            class_weight='balanced', max_iter=5000, random_state=SEED)
-
-    def clf_elasticnet_lr():
-        return SGDClassifier(
-            loss='log_loss', penalty='elasticnet', alpha=0.001, l1_ratio=0.5,
-            class_weight='balanced', max_iter=2000, random_state=SEED)
-
-    def clf_rf():
-        return RandomForestClassifier(
-            n_estimators=200, class_weight='balanced',
-            random_state=SEED, n_jobs=-1)
-
-    def clf_gb():
-        return GradientBoostingClassifier(
-            n_estimators=100, learning_rate=0.1, subsample=0.5,
-            random_state=SEED)
-
-    def clf_xgb():
-        import xgboost as xgb
-        return xgb.XGBClassifier(
-            n_estimators=200, learning_rate=0.1,
-            eval_metric='logloss', random_state=SEED, verbosity=0)
-
-    def clf_lgb():
-        import lightgbm as lgb
-        return lgb.LGBMClassifier(
-            n_estimators=200, learning_rate=0.1,
-            class_weight='balanced', random_state=SEED, verbose=-1)
-
-    classifiers = [
-        ("L1_LR",        clf_l1_lr),
-        ("L2_LR",        clf_l2_lr),
-        ("ElasticNet_LR", clf_elasticnet_lr),
-        ("RF",           clf_rf),
-        ("GB",           clf_gb),
-    ]
-
-    # XGBoost (可选)
-    try:
-        import xgboost
-        classifiers.append(("XGBoost", clf_xgb))
-    except ImportError:
-        log("[WARN] xgboost 未安装, 跳过")
-
-    # LightGBM (可选)
-    try:
-        import lightgbm
-        classifiers.append(("LightGBM", clf_lgb))
-    except ImportError:
-        log("[WARN] lightgbm 未安装, 跳过")
-
-    # ── 笛卡尔积 ──
     combinations = []
     for fe_name, fe_builder in feature_engineerings:
         for clf_name, clf_builder in classifiers:
@@ -278,7 +282,7 @@ def build_model_combinations():
     log(f"  特征工程策略: {len(feature_engineerings)}")
     log(f"  基础分类器: {len(classifiers)}")
     log(f"  笛卡尔积组合: {len(combinations)} 种模型")
-    return combinations
+    return combinations, FE_MAP, CLF_MAP
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -344,8 +348,11 @@ def run_cv_for_task(X_base, y, gene_index, model_combos, task_name, unknown_mask
 
             if fe_obj is not None:
                 try:
-                    # 所有特征工程对象都接受 y (PCA 忽略, SelectFromModel/PLS 需要)
-                    fe_obj.fit(X_train_s, y_train)
+                    # 有监督方法 (PLS/LassoCV) 需要 y, 无监督方法 (PCA) 不需要
+                    if isinstance(fe_obj, tuple(SUPERVISED_FE)):
+                        fe_obj.fit(X_train_s, y_train)
+                    else:
+                        fe_obj.fit(X_train_s)
                     X_train_fe = fe_obj.transform(X_train_s)
                     X_val_fe = fe_obj.transform(X_val_s)
                     X_unk_fe = fe_obj.transform(X_unk_s)
@@ -355,9 +362,8 @@ def run_cv_for_task(X_base, y, gene_index, model_combos, task_name, unknown_mask
                     X_val_fe = X_val_s
                     X_unk_fe = X_unk_s
 
-                # 处理 PLS 输出的特殊情况
+                # 处理 PLS 输出的特殊情况 (transform 返回 X_scores 元组)
                 if isinstance(fe_obj, PLSRegression):
-                    # PLS transform 可能输出 (X_scores, Y_scores)
                     if isinstance(X_train_fe, tuple):
                         X_train_fe = X_train_fe[0]
                     if isinstance(X_val_fe, tuple):
@@ -510,7 +516,7 @@ def main():
     log("\n" + "=" * 70)
     log("STEP 2: 构建 特征工程 × 分类器 笛卡尔积组合")
     log("=" * 70)
-    model_combos = build_model_combinations()
+    model_combos, fe_map, clf_map = build_model_combinations()
     model_names = [m[0] for m in model_combos]
     log(f"  共 {len(model_combos)} 种模型组合")
 
@@ -631,22 +637,26 @@ def main():
                 scaler = StandardScaler()
                 X_s = scaler.fit_transform(X_lbl)
 
-                # Fit feature engineering on labeled data
-                fe_map = {"raw": fe_raw, "pca_10": fe_pca_10, "pca_50": fe_pca_50,
-                          "lasso_sel": fe_lasso_sel, "pls_10": fe_pls_10}
-                clf_map = {"L1_LR": clf_l1_lr, "L2_LR": clf_l2_lr, "ElasticNet_LR": clf_elasticnet_lr,
-                           "RF": clf_rf, "GB": clf_gb, "XGBoost": clf_xgb, "LightGBM": clf_lgb}
+                # 使用 build_model_combinations 返回的 fe_map / clf_map
+                fe_builder = fe_map.get(fe_name)
+                clf_builder = clf_map.get(clf_name)
+                if fe_builder is None or clf_builder is None:
+                    log(f"    [WARN] {best_model_name}: 未找到 builder 函数")
+                    continue
 
-                fe_obj = fe_map[fe_name]()
+                fe_obj = fe_builder()
                 if fe_obj is not None:
-                    fe_obj.fit(X_s, y_lbl)
+                    if isinstance(fe_obj, tuple(SUPERVISED_FE)):
+                        fe_obj.fit(X_s, y_lbl)
+                    else:
+                        fe_obj.fit(X_s)
                     X_fe = fe_obj.transform(X_s)
                     if isinstance(X_fe, tuple):
                         X_fe = X_fe[0]
                 else:
                     X_fe = X_s
 
-                clf = clf_map[clf_name]()
+                clf = clf_builder()
                 clf.fit(X_fe, y_lbl)
 
                 # For raw features, extract importance on original feature names
