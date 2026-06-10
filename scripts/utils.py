@@ -1,0 +1,527 @@
+# ============================================================
+# 石竹烯(BCP) × 铜死亡 × CIRI 靶点筛选系统 - 工具函数模块
+# ============================================================
+# 版本: v2.0 | 日期: 2026-05-11
+# 功能: 通用工具函数、数据加载、基因映射、可视化辅助
+# 参考: PMID: 41234537 (WGCNA+MCODE+ML), PMID: 41791684 (scTenifoldKnk)
+# ============================================================
+
+import os
+import sys
+import warnings
+import logging
+import copy
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Union, Any
+from collections import OrderedDict
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.spatial.distance import pdist, squareform
+
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# 0. 日志配置
+# ============================================================
+def setup_logger(name: str, log_file: str, level: int = logging.INFO) -> logging.Logger:
+    """配置日志系统，同时输出到文件和终端"""
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.handlers.clear()
+
+    fh = logging.FileHandler(log_file, encoding='utf-8')
+    fh.setLevel(level)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(level)
+
+    formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+
+def ensure_dir(dir_path: str) -> str:
+    """确保目录存在，不存在则创建"""
+    os.makedirs(dir_path, exist_ok=True)
+    return dir_path
+
+
+# ============================================================
+# 1. 数据加载与验证
+# ============================================================
+def load_gse61616_top_table(filepath: str) -> pd.DataFrame:
+    """加载GSE61616 GEO2R差异分析结果"""
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"文件不存在: {filepath}")
+
+    df = pd.read_csv(filepath, sep='\t')
+
+    required_cols = ['logFC', 'adj.P.Val', 'P.Value', 'Gene.symbol']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"缺少必要列: {missing}，实际列: {list(df.columns)}")
+
+    if df.shape[0] == 0:
+        raise ValueError("数据为空")
+
+    df['Gene.symbol'] = df['Gene.symbol'].fillna('').astype(str)
+    df = df[df['Gene.symbol'] != ''].copy()
+    df['Gene.symbol'] = df['Gene.symbol'].str.upper()
+
+    return df
+
+
+def load_expression_matrix(filepath: str) -> pd.DataFrame:
+    """加载表达矩阵CSV文件"""
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"文件不存在: {filepath}")
+
+    df = pd.read_csv(filepath, index_col=0)
+    if df.shape[0] == 0 or df.shape[1] == 0:
+        raise ValueError("表达矩阵为空")
+
+    return df
+
+
+def validate_input_data(df: pd.DataFrame, name: str = "数据") -> None:
+    """验证输入数据的基本质量"""
+    if df is None:
+        raise ValueError(f"{name}为None")
+    if df.shape[0] == 0:
+        raise ValueError(f"{name}行数为0")
+    if df.isna().all().all():
+        raise ValueError(f"{name}全部为NaN")
+
+    inf_count = np.isinf(df.select_dtypes(include=[np.number]).values).sum()
+    if inf_count > 0:
+        raise ValueError(f"{name}包含{inf_count}个Inf值")
+
+
+# ============================================================
+# 2. 基因映射
+# ============================================================
+def build_gene_mapping(
+    rat_genes: List[str],
+    mapping_file: Optional[str] = None
+) -> Dict[str, str]:
+    """
+    构建大鼠→人类基因映射
+    优先使用本地映射文件，否则使用Ensembl同源基因数据库
+    """
+    mapping = {}
+
+    if mapping_file and os.path.exists(mapping_file):
+        try:
+            map_df = pd.read_csv(mapping_file, sep='\t')
+            if 'Rat' in map_df.columns and 'Human' in map_df.columns:
+                for _, row in map_df.iterrows():
+                    rat_gene = str(row['Rat']).strip().upper()
+                    human_gene = str(row['Human']).strip().upper()
+                    if rat_gene and human_gene and human_gene not in ['', '---', 'nan']:
+                        mapping[rat_gene] = human_gene
+                logger = logging.getLogger(__name__)
+                logger.info(f"从本地映射文件加载: {len(mapping)} 个基因对")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"加载映射文件失败: {e}")
+
+    if not mapping:
+        mapping = _build_homology_mapping(rat_genes)
+
+    return mapping
+
+
+def _build_homology_mapping(rat_genes: List[str]) -> Dict[str, str]:
+    """
+    基于Ensembl BioMart同源基因规则构建映射
+    使用已知的rat→human 1:1 orthologs
+    参考: Ensembl Compara, PMID: 29194479
+    """
+    common_orthologs = {
+        'FDX1': 'FDX1', 'LIAS': 'LIAS', 'LIPT1': 'LIPT1', 'DLAT': 'DLAT',
+        'PDHA1': 'PDHA1', 'PDHB': 'PDHB', 'MTF1': 'MTF1', 'GLS': 'GLS',
+        'CDKN2A': 'CDKN2A', 'SLC31A1': 'CTR1', 'ATP7A': 'ATP7A',
+        'ATP7B': 'ATP7B', 'DLD': 'DLD', 'DBT': 'DBT', 'DLST': 'DLST',
+        'PDHA2': 'PDHA2', 'GCSH': 'GCSH',
+        'TNF': 'TNF', 'IL6': 'IL6', 'IL1B': 'IL1B', 'NFKB1': 'NFKB1',
+        'CXCL8': 'CXCL8', 'CXCL1': 'CXCL1', 'CXCL2': 'CXCL2', 'CCL2': 'CCL2',
+        'PTGS2': 'PTGS2', 'SELE': 'SELE', 'ICAM1': 'ICAM1', 'VCAM1': 'VCAM1',
+        'HIF1A': 'HIF1A', 'VEGFA': 'VEGFA', 'NOS2': 'NOS2', 'SOD2': 'SOD2',
+        'BAX': 'BAX', 'BCL2': 'BCL2', 'CASP3': 'CASP3', 'TP53': 'TP53',
+        'MAPK1': 'MAPK1', 'MAPK3': 'MAPK3', 'JUN': 'JUN', 'FOS': 'FOS',
+        'ATF3': 'ATF3', 'DUSP1': 'DUSP1', 'EGR1': 'EGR1', 'NFKBIA': 'NFKBIA',
+        'AKT1': 'AKT1', 'MTOR': 'MTOR', 'PIK3CA': 'PIK3CA', 'PTEN': 'PTEN',
+        'STAT3': 'STAT3', 'JAK2': 'JAK2', 'TYK2': 'TYK2',
+        'HSPA5': 'HSPA5', 'XBP1': 'XBP1', 'EIF2AK3': 'EIF2AK3', 'ATF4': 'ATF4',
+        'ATF6': 'ATF6', 'ERN1': 'ERN1', 'HSP90B1': 'HSP90B1', 'CALR': 'CALR',
+    }
+    
+    mapping = {}
+    for gene in rat_genes:
+        gene_upper = gene.upper()
+        if gene_upper in common_orthologs:
+            mapping[gene_upper] = common_orthologs[gene_upper]
+        else:
+            mapping[gene_upper] = gene_upper
+    
+    return mapping
+
+
+def map_rat_to_human(
+    rat_genes: List[str],
+    mapping: Dict[str, str]
+) -> Tuple[List[str], List[str]]:
+    """将大鼠基因列表映射为人类基因列表"""
+    mapped = []
+    unmapped = []
+
+    for gene in rat_genes:
+        gene_upper = gene.upper()
+        if gene_upper in mapping:
+            mapped.append(mapping[gene_upper])
+        else:
+            unmapped.append(gene_upper)
+
+    return list(set(mapped)), list(set(unmapped))
+
+
+# ============================================================
+# 3. 基因集操作
+# ============================================================
+def gene_set_intersection(*sets: List[str]) -> List[str]:
+    """多个基因集的交集"""
+    if not sets:
+        return []
+    result = set(sets[0])
+    for s in sets[1:]:
+        result = result.intersection(set(s))
+    return sorted(list(result))
+
+
+def gene_set_union(*sets: List[str]) -> List[str]:
+    """多个基因集的并集"""
+    result = set()
+    for s in sets:
+        result = result.union(set(s))
+    return sorted(list(result))
+
+
+def gene_set_difference(set_a: List[str], set_b: List[str]) -> List[str]:
+    """基因集差集 A - B"""
+    return sorted(list(set(set_a) - set(set_b)))
+
+
+# ============================================================
+# 4. 统计函数
+# ============================================================
+def fdr_correction(p_values: np.ndarray, method: str = 'bh') -> np.ndarray:
+    """FDR多重检验校正 (Benjamini-Hochberg)"""
+    p_values = np.asarray(p_values, dtype=np.float64)
+    if np.any(np.isnan(p_values)):
+        raise ValueError("p值包含NaN")
+
+    n = len(p_values)
+    if n == 0:
+        return np.array([])
+
+    if method == 'bh':
+        sorted_indices = np.argsort(p_values)
+        sorted_p = p_values[sorted_indices]
+        adjusted = np.minimum(1, sorted_p * n / np.arange(1, n + 1))
+        adjusted = np.maximum.accumulate(adjusted[::-1])[::-1]
+        result = np.zeros(n)
+        result[sorted_indices] = adjusted
+        return result
+    else:
+        return p_values * n
+
+
+def safe_log2(x: np.ndarray) -> np.ndarray:
+    """安全的log2转换，处理0值"""
+    x = np.asarray(x, dtype=np.float64)
+    x_safe = np.where(x <= 0, np.nanmin(x[x > 0]) if np.any(x > 0) else 1e-10, x)
+    return np.log2(x_safe)
+
+
+# ============================================================
+# 5. 可视化辅助
+# ============================================================
+def setup_plotting_style():
+    """设置统一的绘图风格"""
+    plt.rcParams.update({
+        'font.sans-serif': ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans'],
+        'axes.unicode_minus': False,
+        'figure.dpi': 150,
+        'savefig.dpi': 300,
+        'savefig.bbox': 'tight',
+        'savefig.format': 'pdf',
+        'font.size': 10,
+        'axes.titlesize': 12,
+        'axes.labelsize': 11,
+    })
+
+
+def save_figure(fig: plt.Figure, filepath: str, dpi: int = 300):
+    """保存图片为PDF和PNG"""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    base = os.path.splitext(filepath)[0]
+    fig.savefig(f"{base}.pdf", dpi=dpi, bbox_inches='tight', format='pdf')
+    fig.savefig(f"{base}.png", dpi=dpi, bbox_inches='tight', format='png')
+    plt.close(fig)
+
+
+def create_volcano_plot(
+    df: pd.DataFrame,
+    logfc_col: str = 'logFC',
+    pval_col: str = 'adj.P.Val',
+    gene_col: str = 'Gene.symbol',
+    title: str = 'Volcano Plot',
+    logfc_thresh: float = 1.0,
+    pval_thresh: float = 0.05,
+    highlight_genes: Optional[List[str]] = None,
+    output_path: Optional[str] = None
+) -> plt.Figure:
+    """绘制火山图"""
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    df_plot = df.copy()
+    df_plot['-log10(adj.P)'] = -np.log10(df_plot[pval_col].clip(lower=1e-300))
+
+    df_plot['category'] = 'NS'
+    up_mask = (df_plot[logfc_col] >= logfc_thresh) & (df_plot[pval_col] < pval_thresh)
+    down_mask = (df_plot[logfc_col] <= -logfc_thresh) & (df_plot[pval_col] < pval_thresh)
+    df_plot.loc[up_mask, 'category'] = 'Up'
+    df_plot.loc[down_mask, 'category'] = 'Down'
+
+    colors = {'NS': '#7f7f7f', 'Up': '#e74c3c', 'Down': '#3498db'}
+    for cat, color in colors.items():
+        mask = df_plot['category'] == cat
+        ax.scatter(
+            df_plot.loc[mask, logfc_col],
+            df_plot.loc[mask, '-log10(adj.P)'],
+            c=color, s=8, alpha=0.5, label=f'{cat} ({mask.sum()})', rasterized=True
+        )
+
+    if highlight_genes:
+        highlight_mask = df_plot[gene_col].isin([g.upper() for g in highlight_genes])
+        ax.scatter(
+            df_plot.loc[highlight_mask, logfc_col],
+            df_plot.loc[highlight_mask, '-log10(adj.P)'],
+            c='#ff7f0e', s=40, edgecolors='black', linewidth=0.5,
+            label=f'Highlight ({highlight_mask.sum()})', zorder=5
+        )
+
+    ax.axhline(-np.log10(pval_thresh), color='grey', linestyle='--', linewidth=0.8)
+    ax.axvline(logfc_thresh, color='grey', linestyle='--', linewidth=0.8)
+    ax.axvline(-logfc_thresh, color='grey', linestyle='--', linewidth=0.8)
+
+    ax.set_xlabel('log2 Fold Change')
+    ax.set_ylabel('-log10(adjusted P-value)')
+    ax.set_title(title)
+    ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
+
+    if output_path:
+        save_figure(fig, output_path)
+
+    return fig
+
+
+def create_heatmap(
+    data: pd.DataFrame,
+    title: str = 'Heatmap',
+    cmap: str = 'RdBu_r',
+    output_path: Optional[str] = None
+) -> plt.Figure:
+    """绘制热图"""
+    fig, ax = plt.subplots(figsize=(12, max(6, data.shape[0] * 0.3)))
+
+    sns.heatmap(
+        data, cmap=cmap, center=0,
+        xticklabels=True, yticklabels=True,
+        linewidths=0.5, linecolor='#f0f0f0',
+        cbar_kws={'label': 'Expression (Z-score)'},
+        ax=ax
+    )
+
+    ax.set_title(title)
+    ax.set_xlabel('Samples')
+    ax.set_ylabel('Genes')
+    plt.tight_layout()
+
+    if output_path:
+        save_figure(fig, output_path)
+
+    return fig
+
+
+# ============================================================
+# 6. 结果保存
+# ============================================================
+def save_results_table(
+    df: pd.DataFrame,
+    filepath: str,
+    index: bool = True,
+    sheet_name: str = 'Results'
+):
+    """保存结果为CSV和Excel"""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    base = os.path.splitext(filepath)[0]
+    df.to_csv(f"{base}.csv", index=index, encoding='utf-8-sig')
+
+    try:
+        with pd.ExcelWriter(f"{base}.xlsx", engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name=sheet_name, index=index)
+    except Exception:
+        pass
+
+
+def save_gene_list(genes: List[str], filepath: str, description: str = ""):
+    """保存基因列表"""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        if description:
+            f.write(f"# {description}\n")
+        f.write(f"# Total: {len(genes)}\n")
+        for gene in genes:
+            f.write(f"{gene}\n")
+
+
+# ============================================================
+# 7. 进度报告
+# ============================================================
+def print_stage_header(stage: int, name: str):
+    """打印阶段标题"""
+    print("\n" + "=" * 70)
+    print(f"  阶段 {stage}: {name}")
+    print("=" * 70)
+
+
+def print_summary(stats_dict: Dict[str, Any]):
+    """打印统计摘要"""
+    print("\n" + "-" * 50)
+    for key, value in stats_dict.items():
+        print(f"  {key}: {value}")
+    print("-" * 50)
+
+
+if __name__ == "__main__":
+    print("工具函数模块加载成功")
+
+
+# ============================================================
+# 8. LASSO稳定性选择 (Stability Selection)
+# ============================================================
+def stability_selection_lasso(X, y, gene_names, n_bootstrap=100,
+                               threshold=0.8, C='optimal', min_genes=30, max_genes=80):
+    """
+    Bootstrap LASSO 稳定性选择 (Stability Selection)
+    参考: Meinshausen & Bühlmann, 2010, J. R. Stat. Soc. B
+    
+    Parameters:
+    -----------
+    C : str or float
+        正则化参数。'optimal'表示使用5折交叉验证自动选择最优C值
+        也可传入固定值(如0.1)用于特定场景
+    
+    Returns:
+    --------
+    selected_genes : list
+        稳定选择的基因列表
+    selection_freq : dict
+        每个基因的选择频率
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import cross_val_score
+
+    n_samples, n_genes = X.shape
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    if C == 'optimal':
+        C_range = np.logspace(-3, 1, 20)
+        best_C = None
+        best_score = -np.inf
+        
+        for c_val in C_range:
+            try:
+                model = LogisticRegression(
+                    penalty='l1', solver='liblinear', C=c_val,
+                    max_iter=3000, random_state=42
+                )
+                scores = cross_val_score(model, X_scaled, y, cv=5, scoring='accuracy')
+                mean_score = scores.mean()
+                
+                if mean_score > best_score:
+                    best_score = mean_score
+                    best_C = c_val
+            except Exception:
+                continue
+        
+        if best_C is None:
+            best_C = 0.1
+        C = best_C
+        print(f"  LASSO交叉验证最优C值: {C:.4f} (CV accuracy: {best_score:.4f})")
+
+    selection_counts = {g: 0 for g in gene_names}
+
+    for i in range(n_bootstrap):
+        idx = np.random.choice(n_samples, size=n_samples, replace=True)
+        X_boot, y_boot = X_scaled[idx], y[idx]
+
+        model = LogisticRegression(
+            penalty='l1', solver='liblinear', C=C,
+            max_iter=3000, random_state=42 + i
+        )
+        try:
+            model.fit(X_boot, y_boot)
+            coef = model.coef_[0]
+            for j, g in enumerate(gene_names):
+                if abs(coef[j]) > 1e-6:
+                    selection_counts[g] += 1
+        except Exception:
+            continue
+
+    freq = {g: c / n_bootstrap for g, c in selection_counts.items()}
+
+    selected = [g for g, f in freq.items() if f >= threshold]
+
+    if len(selected) < min_genes:
+        sorted_genes = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+        selected = [g for g, _ in sorted_genes[:min_genes]]
+    if len(selected) > max_genes:
+        sorted_genes = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+        selected = [g for g, _ in sorted_genes[:max_genes]]
+
+    cupro_core = {"FDX1", "LIAS", "LIPT1", "DLAT", "PDHA1", "PDHB",
+                   "MTF1", "GLS", "CDKN2A", "SLC31A1", "ATP7A", "ATP7B",
+                   "DLD", "DBT", "DLST", "PDHA2", "GCSH"}
+    
+    freq_sorted = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+    top_genes = [g for g, _ in freq_sorted[:max(50, len(selected)+len(cupro_core))]]
+    selected = [g for g in top_genes if g not in cupro_core][:max_genes]
+    
+    forced = [g for g in cupro_core if g in gene_names and g not in selected]
+    if forced:
+        remaining_slots = max_genes - len(selected)
+        if remaining_slots > 0:
+            selected.extend(forced[:remaining_slots])
+        else:
+            selected = selected[:max_genes - len(forced)] + forced
+
+    return selected, freq

@@ -1,0 +1,77 @@
+# 石竹烯-CIRI GATv2 配置文件（重构版）
+# 对应脚本: 石竹烯_CIRI_全流程整合脚本_v2.py
+
+# 模型架构 - GATv2 标准范式
+model:
+  name: "GATv2"
+  in_channels: 35  # 会被实际特征维度自动覆盖
+  hidden_channels: 64
+  out_channels: 32
+  num_heads: 4
+  num_classes: 2
+  dropout: 0.5
+  attention_dropout: 0.5
+  use_edge_attr: true   # 使用 edge_attr (STRING combined_score 作为边特征)
+  use_batch_norm: false
+
+# 训练超参数
+training:
+  epochs: 300
+  patience: 15
+  learning_rate: 0.001
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  pos_weight: "auto"
+  scheduler: "cosine"
+  scheduler_t_max: 300
+  scheduler_factor: 0.5
+  scheduler_patience: 10
+  
+  # FIX-B-4: 数据分割比例
+  train_ratio: 0.6
+  val_ratio: 0.2
+  test_ratio: 0.2
+  random_state: 42
+  
+  # FIX-E-4: 早停指标改为AUPRC
+  early_stop_metric: "pr_auc"
+  
+  # FIX-D-3: 铜死亡基因先验损失（权重提升至0.2）
+  cupro_weight: 0.2
+  
+  # 铜死亡基因列表
+  cupro_genes:
+    - "FDX1"
+    - "LIAS"
+    - "LIPT1"
+    - "DLAT"
+    - "PDHB"
+    - "PDHX"
+    - "SLC31A1"
+    - "ATP7A"
+    - "ATP7B"
+    - "ATOX1"
+    - "NFE2L2"
+    - "HIF1A"
+    - "MTOR"
+    - "NFKB1"
+    - "GPX4"
+
+# 数据整合参数
+data:
+  deg_logfc_threshold: 1.0
+  deg_pval_threshold: 0.05
+  string_min_score: 400
+  
+  # FIX-A-7: MR参数
+  mr_pval_threshold: 0.05
+  mr_file: "MR_batch_summary_20260506/01_MR_results_main.csv"
+  
+  # FIX-C-12: 特征列表（供参考）
+  feature_groups:
+    deg: ["logFC", "abs_logFC", "neg_log10_P", "neg_log10_adjP", "AveExpr"]
+    topology: ["Degree", "PageRank", "ClusteringCoefficient", "Betweenness", "Closeness", "Eigenvector"]
+    pathway_distance: ["dist_to_inflammation", "dist_to_cuproptosis"]
+    mr: ["MR_neg_log10_pval", "MR_abs_b", "MR_fdr_qval"]
+    single_cell: ["is_comm_ligand", "is_comm_receptor"]
+    marker: ["is_cuproptosis"]

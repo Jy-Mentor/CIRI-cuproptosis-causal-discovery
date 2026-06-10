@@ -28,8 +28,7 @@ import io
 import re
 import warnings
 import logging
-from scipy import stats
-from statsmodels.stats.multitest import multipletests
+from scripts.geo_data_processor import GEODataProcessor
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -73,152 +72,8 @@ DEG_CONFIG = {
 }
 
 # ============================================================
-# 工具函数
+# 工具函数（复用统一模块 geo_data_processor）
 # ============================================================
-
-def find_file(dir_path, patterns):
-    """在目录中查找匹配模式的文件"""
-    for f in os.listdir(dir_path):
-        for pat in patterns:
-            if pat.lower() in f.lower():
-                return os.path.join(dir_path, f)
-    return None
-
-def parse_series_matrix(filepath):
-    """解析GEO Series Matrix文件，返回表达矩阵和列名"""
-    open_func = gzip.open if filepath.endswith('.gz') else open
-    with open_func(filepath, 'rt', encoding='latin-1') as f:
-        content = f.read()
-
-    meta = {}
-    for line in content.splitlines():
-        if line.startswith('!Sample_title'):
-            parts = line.split('\t')
-            meta['sample_titles'] = [p.strip('"') for p in parts[1:]]
-        elif line.startswith('!Sample_geo_accession'):
-            parts = line.split('\t')
-            meta['sample_geo'] = [p.strip('"') for p in parts[1:]]
-
-    data_start = content.find('!series_matrix_table_begin')
-    data_end = content.find('!series_matrix_table_end')
-    if data_start == -1 or data_end == -1:
-        raise ValueError(f'无法在 {filepath} 中找到 series_matrix_table 标记')
-
-    table_text = content[data_start:data_end]
-    table_text = table_text.replace('!series_matrix_table_begin', '').strip()
-
-    df = pd.read_csv(io.StringIO(table_text), sep='\t', quoting=1,
-                     dtype=str, low_memory=False)
-    if 'ID_REF' in df.columns:
-        df = df.set_index('ID_REF')
-    else:
-        df = df.set_index(df.columns[0])
-
-    df = df.apply(pd.to_numeric, errors='coerce')
-    return df, meta
-
-
-def parse_gpl1355_annotation(filepath):
-    """解析GPL1355平台注释文件，返回探针→Gene Symbol映射"""
-    mapping = {}
-    with open(filepath, 'r', encoding='latin-1') as f:
-        for line in f:
-            if line.startswith('#') or line.strip() == '':
-                continue
-            parts = line.strip().split('\t')
-            if len(parts) < 11:
-                continue
-            probe_id = parts[0].strip()
-            gene_symbol = parts[10].strip()  # Gene Symbol列
-            if gene_symbol and gene_symbol != '---':
-                mapping[probe_id] = gene_symbol.split('///')[0].strip()
-    return mapping
-
-
-def collapse_probes_to_genes(expr_df, probe_to_gene):
-    """将探针级别的表达矩阵折叠为基因级别（取每个基因平均表达最高的探针）"""
-    mapped_probes = set(probe_to_gene.keys()) & set(expr_df.index)
-    expr_mapped = expr_df.loc[list(mapped_probes)]
-    probe_to_gene_sub = {p: probe_to_gene[p] for p in mapped_probes}
-
-    gene_rows = []
-    for gene in set(probe_to_gene_sub.values()):
-        probes = [p for p in mapped_probes if probe_to_gene_sub[p] == gene]
-        if len(probes) == 1:
-            gene_rows.append((gene, expr_mapped.loc[probes[0]]))
-        else:
-            sub = expr_mapped.loc[probes]
-            mean_expr = sub.mean(axis=1)
-            best_probe = mean_expr.idxmax()
-            gene_rows.append((gene, expr_mapped.loc[best_probe]))
-
-    result = pd.DataFrame([row[1] for row in gene_rows], index=[r[0] for r in gene_rows])
-    return result
-
-
-def deg_microarray_t_test(expr_df, case_samples, control_samples):
-    """对芯片表达矩阵执行Welch t-test + Benjamini-Hochberg校正"""
-    results = []
-    case = expr_df[case_samples].values
-    control = expr_df[control_samples].values
-
-    for i, gene in enumerate(expr_df.index):
-        c = control[i, :].astype(float)
-        t = case[i, :].astype(float)
-        if np.all(np.isnan(c)) or np.all(np.isnan(t)):
-            continue
-        c = c[~np.isnan(c)]
-        t = t[~np.isnan(t)]
-        if len(c) < 2 or len(t) < 2:
-            continue
-        log2fc = np.mean(t) - np.mean(c)
-        stat, pval = stats.ttest_ind(t, c, equal_var=False)
-        results.append({
-            'gene_symbol': gene,
-            'log2FoldChange': log2fc,
-            'stat': stat,
-            'pvalue': pval
-        })
-
-    res_df = pd.DataFrame(results)
-    if res_df.empty:
-        return res_df
-
-    reject, padj, _, _ = multipletests(res_df['pvalue'], method='fdr_bh')
-    res_df['padj'] = padj
-    res_df = res_df.sort_values('pvalue')
-    return res_df
-
-
-def deg_rnaseq_pydeseq2(counts_df, metadata, case_label, control_label):
-    """对RNA-seq计数矩阵执行PyDESeq2差异表达分析"""
-    from pydeseq2.dds import DeseqDataSet
-    from pydeseq2.ds import DeseqStats
-
-    samples = metadata.index.tolist()
-    common_genes = counts_df.index.tolist()
-
-    counts_sub = counts_df.loc[common_genes, samples].astype(int)
-    counts_sub = counts_sub[~(counts_sub == 0).all(axis=1)]
-
-    dds = DeseqDataSet(
-        counts=counts_sub.T,
-        metadata=metadata,
-        design='~condition',
-    )
-    dds.deseq2()
-
-    stat_res = DeseqStats(dds, contrast=['condition', case_label, control_label])
-    stat_res.summary()
-
-    result = stat_res.results_df.copy()
-    result = result.reset_index()
-    first_col = result.columns[0]
-    if first_col != 'gene_symbol':
-        result = result.rename(columns={first_col: 'gene_symbol'})
-    result = result[['gene_symbol', 'log2FoldChange', 'pvalue', 'padj']].dropna()
-    return result
-
 
 # ============================================================
 # 数据集处理函数
@@ -230,12 +85,12 @@ def process_gse61616():
     logger.info('开始处理 GSE61616 (7d 大鼠芯片，Model vs Sham)')
     dir_path = BASE_DIRS['GSE61616']
 
-    sm_file = find_file(dir_path, ['series_matrix.txt'])
+    sm_file = GEODataProcessor.find_file(dir_path, ['series_matrix.txt'])
     if not sm_file:
         raise FileNotFoundError(f'未在 {dir_path} 中找到series matrix文件')
     logger.info(f'发现Series Matrix文件: {sm_file}')
 
-    expr_df, meta = parse_series_matrix(sm_file)
+    expr_df, meta = GEODataProcessor.parse_series_matrix(sm_file, return_meta=True)
     logger.info(f'表达矩阵维度: {expr_df.shape}')
 
     avail_samples = set(expr_df.columns)
@@ -251,15 +106,15 @@ def process_gse61616():
 
     if plat_file:
         logger.info(f'读取GPL1355平台注释: {plat_file}')
-        probe_to_gene = parse_gpl1355_annotation(plat_file)
+        probe_to_gene = GEODataProcessor.parse_gpl1355_annotation(plat_file)
         logger.info(f'注释映射数: {len(probe_to_gene)}')
-        expr_gene = collapse_probes_to_genes(expr_df, probe_to_gene)
+        expr_gene = GEODataProcessor.collapse_probes_to_genes(expr_df, probe_to_gene)
         logger.info(f'折叠为基因后维度: {expr_gene.shape}')
     else:
         logger.warning('未找到GPL1355注释文件，直接使用探针ID')
         expr_gene = expr_df
 
-    result = deg_microarray_t_test(expr_gene, model_sams, sham_sams)
+    result = GEODataProcessor.deg_microarray_t_test(expr_gene, model_sams, sham_sams)
     return result
 
 
@@ -269,12 +124,12 @@ def process_gse97537():
     logger.info('开始处理 GSE97537 (24H 大鼠芯片，MCAO vs Sham)')
     dir_path = BASE_DIRS['GSE97537']
 
-    sm_file = find_file(dir_path, ['series_matrix.txt'])
+    sm_file = GEODataProcessor.find_file(dir_path, ['series_matrix.txt'])
     if not sm_file:
         raise FileNotFoundError(f'未在 {dir_path} 中找到series matrix文件')
     logger.info(f'发现Series Matrix文件: {sm_file}')
 
-    expr_df, meta = parse_series_matrix(sm_file)
+    expr_df, meta = GEODataProcessor.parse_series_matrix(sm_file, return_meta=True)
     logger.info(f'表达矩阵维度: {expr_df.shape}')
 
     avail_samples = set(expr_df.columns)
@@ -283,21 +138,21 @@ def process_gse97537():
     logger.info(f'Sham样本数: {len(sham_sams)}, MCAO样本数: {len(mcao_sams)}')
 
     plat_dir = BASE_DIRS['GSE97537']
-    plat_file = find_file(plat_dir, ['GPL1355'])
+    plat_file = GEODataProcessor.find_file(plat_dir, ['GPL1355'])
     if not plat_file:
         plat_file = PLATFORM_FILE_GPL1355 if os.path.exists(PLATFORM_FILE_GPL1355) else None
 
     if plat_file:
         logger.info(f'读取GPL1355平台注释: {plat_file}')
-        probe_to_gene = parse_gpl1355_annotation(plat_file)
+        probe_to_gene = GEODataProcessor.parse_gpl1355_annotation(plat_file)
         logger.info(f'注释映射数: {len(probe_to_gene)}')
-        expr_gene = collapse_probes_to_genes(expr_df, probe_to_gene)
+        expr_gene = GEODataProcessor.collapse_probes_to_genes(expr_df, probe_to_gene)
         logger.info(f'折叠为基因后维度: {expr_gene.shape}')
     else:
         logger.warning('未找到GPL1355注释文件，直接使用探针ID')
         expr_gene = expr_df
 
-    result = deg_microarray_t_test(expr_gene, mcao_sams, sham_sams)
+    result = GEODataProcessor.deg_microarray_t_test(expr_gene, mcao_sams, sham_sams)
     return result
 
 
@@ -307,7 +162,7 @@ def process_gse104036():
     logger.info('开始处理 GSE104036 (多时序 小鼠RNA-seq，Ipsilateral vs Sham)')
     dir_path = BASE_DIRS['GSE104036']
 
-    count_file = find_file(dir_path, ['counts.txt'])
+    count_file = GEODataProcessor.find_file(dir_path, ['counts.txt'])
     if not count_file:
         raise FileNotFoundError(f'未在 {dir_path} 中找到count matrix文件')
     logger.info(f'发现Count Matrix文件: {count_file}')
@@ -347,7 +202,7 @@ def process_gse104036():
     metadata.loc[sham_cols, 'condition'] = 'Sham'
     metadata.loc[ipsi_cols, 'condition'] = 'Ipsilateral'
 
-    result = deg_rnaseq_pydeseq2(df, metadata, 'Ipsilateral', 'Sham')
+    result = GEODataProcessor.deg_rnaseq_pydeseq2(df, metadata, 'Ipsilateral', 'Sham')
     return result
 
 

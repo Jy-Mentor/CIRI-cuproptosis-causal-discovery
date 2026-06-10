@@ -15,8 +15,7 @@ import os
 import io
 import warnings
 import logging
-from scipy import stats
-from statsmodels.stats.multitest import multipletests
+from scripts.geo_data_processor import GEODataProcessor
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -56,100 +55,8 @@ GSE104036_TIME_MAP = {
 DEG_THRESHOLDS = {'lfc': 1.0, 'padj': 0.05}
 
 # ============================================================
-# 解析工具（复用已有逻辑）
+# 解析工具（复用统一模块）
 # ============================================================
-
-def find_file(dir_path, patterns):
-    for f in os.listdir(dir_path):
-        for pat in patterns:
-            if pat.lower() in f.lower():
-                return os.path.join(dir_path, f)
-    return None
-
-def parse_series_matrix(filepath):
-    open_func = gzip.open if filepath.endswith('.gz') else open
-    with open_func(filepath, 'rt', encoding='latin-1') as f:
-        content = f.read()
-    data_start = content.find('!series_matrix_table_begin')
-    data_end = content.find('!series_matrix_table_end')
-    table_text = content[data_start:data_end].replace('!series_matrix_table_begin', '').strip()
-    df = pd.read_csv(io.StringIO(table_text), sep='\t', quoting=1, dtype=str, low_memory=False)
-    if 'ID_REF' in df.columns:
-        df = df.set_index('ID_REF')
-    else:
-        df = df.set_index(df.columns[0])
-    df = df.apply(pd.to_numeric, errors='coerce')
-    return df
-
-def parse_gpl1355_annotation(filepath):
-    mapping = {}
-    with open(filepath, 'r', encoding='latin-1') as f:
-        for line in f:
-            if line.startswith('#') or line.strip() == '':
-                continue
-            parts = line.strip().split('\t')
-            if len(parts) < 11:
-                continue
-            probe_id = parts[0].strip()
-            gene_symbol = parts[10].strip()
-            if gene_symbol and gene_symbol != '---':
-                mapping[probe_id] = gene_symbol.split('///')[0].strip()
-    return mapping
-
-def collapse_probes_to_genes(expr_df, probe_to_gene):
-    mapped_probes = set(probe_to_gene.keys()) & set(expr_df.index)
-    expr_mapped = expr_df.loc[list(mapped_probes)]
-    probe_to_gene_sub = {p: probe_to_gene[p] for p in mapped_probes}
-    gene_rows = []
-    for gene in set(probe_to_gene_sub.values()):
-        probes = [p for p in mapped_probes if probe_to_gene_sub[p] == gene]
-        if len(probes) == 1:
-            gene_rows.append((gene, expr_mapped.loc[probes[0]]))
-        else:
-            sub = expr_mapped.loc[probes]
-            best_probe = sub.mean(axis=1).idxmax()
-            gene_rows.append((gene, expr_mapped.loc[best_probe]))
-    return pd.DataFrame([r[1] for r in gene_rows], index=[r[0] for r in gene_rows])
-
-def deg_microarray_t_test(expr_df, case_samples, control_samples):
-    results = []
-    case = expr_df[case_samples].values
-    control = expr_df[control_samples].values
-    for i, gene in enumerate(expr_df.index):
-        c = control[i, :].astype(float)
-        t = case[i, :].astype(float)
-        if np.all(np.isnan(c)) or np.all(np.isnan(t)):
-            continue
-        c = c[~np.isnan(c)]
-        t = t[~np.isnan(t)]
-        if len(c) < 2 or len(t) < 2:
-            continue
-        log2fc = np.mean(t) - np.mean(c)
-        stat, pval = stats.ttest_ind(t, c, equal_var=False)
-        results.append({'gene_symbol': gene, 'log2FoldChange': log2fc,
-                        'stat': stat, 'pvalue': pval})
-    res_df = pd.DataFrame(results)
-    if res_df.empty:
-        return res_df
-    _, padj, _, _ = multipletests(res_df['pvalue'], method='fdr_bh')
-    res_df['padj'] = padj
-    return res_df.sort_values('pvalue')
-
-def deg_rnaseq_pydeseq2(counts_df, metadata, case_label, control_label):
-    from pydeseq2.dds import DeseqDataSet
-    from pydeseq2.ds import DeseqStats
-    samples = metadata.index.tolist()
-    counts_sub = counts_df.loc[:, samples].astype(int)
-    counts_sub = counts_sub.loc[~(counts_sub == 0).all(axis=1)]
-    dds = DeseqDataSet(counts=counts_sub.T, metadata=metadata, design='~condition')
-    dds.deseq2()
-    stat_res = DeseqStats(dds, contrast=['condition', case_label, control_label])
-    stat_res.summary()
-    result = stat_res.results_df.copy().reset_index()
-    first_col = result.columns[0]
-    if first_col != 'gene_symbol':
-        result = result.rename(columns={first_col: 'gene_symbol'})
-    return result[['gene_symbol', 'log2FoldChange', 'pvalue', 'padj']].dropna()
 
 def filter_deg(deg_df):
     if deg_df is None or deg_df.empty:
@@ -167,7 +74,7 @@ def filter_deg(deg_df):
 def load_gse104036_full_counts():
     """加载GSE104036完整count矩阵，去重"""
     dir_path = BASE_DIRS['GSE104036']
-    count_file = find_file(dir_path, ['counts.txt'])
+    count_file = GEODataProcessor.find_file(dir_path, ['counts.txt'])
     df = pd.read_csv(count_file, sep='\t', dtype=str, low_memory=False)
     df = df.set_index(df.columns[0])
     df = df.apply(pd.to_numeric, errors='coerce').fillna(0).astype(int)
@@ -179,9 +86,9 @@ def load_gse104036_full_counts():
 def process_microarray(dataset_key):
     """统一处理芯片数据（GSE61616或GSE97537）"""
     dir_path = BASE_DIRS[dataset_key]
-    sm_file = find_file(dir_path, ['series_matrix.txt'])
+    sm_file = GEODataProcessor.find_file(dir_path, ['series_matrix.txt'])
     logger.info(f'[{dataset_key}] 加载 Series Matrix: {os.path.basename(sm_file)}')
-    expr_df = parse_series_matrix(sm_file)
+    expr_df = GEODataProcessor.parse_series_matrix(sm_file)
     logger.info(f'  表达矩阵: {expr_df.shape}')
 
     groups = GSE61616_GROUPS if dataset_key == 'GSE61616' else GSE97537_GROUPS
@@ -192,18 +99,18 @@ def process_microarray(dataset_key):
     case_sams = [s for s in groups[case_lbl] if s in avail]
     logger.info(f'  对照{len(control_sams)}个, 处理{len(case_sams)}个')
 
-    plat_file = find_file(dir_path, ['GPL1355'])
+    plat_file = GEODataProcessor.find_file(dir_path, ['GPL1355'])
     if not plat_file and os.path.exists(PLATFORM_FILE_GPL1355):
         plat_file = PLATFORM_FILE_GPL1355
 
     if plat_file:
-        probe_map = parse_gpl1355_annotation(plat_file)
-        expr_gene = collapse_probes_to_genes(expr_df, probe_map)
+        probe_map = GEODataProcessor.parse_gpl1355_annotation(plat_file)
+        expr_gene = GEODataProcessor.collapse_probes_to_genes(expr_df, probe_map)
         logger.info(f'  探针→基因: {expr_gene.shape}')
     else:
         expr_gene = expr_df
 
-    deg = deg_microarray_t_test(expr_gene, case_sams, control_sams)
+    deg = GEODataProcessor.deg_microarray_t_test(expr_gene, case_sams, control_sams)
     genes = filter_deg(deg)
     logger.info(f'  DEGs: {len(genes)}')
     return deg, genes
@@ -223,7 +130,7 @@ def process_gse104036_temporal(counts_df):
         meta['condition'] = ['Sham'] * len(sham_cols) + [f'Ipsi_{t}'] * len(ipsi_cols)
 
         logger.info(f'  [GSE104036_{t}] Sham={len(sham_cols)}, Ipsi={len(ipsi_cols)}')
-        deg = deg_rnaseq_pydeseq2(counts_df, meta, f'Ipsi_{t}', 'Sham')
+        deg = GEODataProcessor.deg_rnaseq_pydeseq2(counts_df, meta, f'Ipsi_{t}', 'Sham')
         genes = filter_deg(deg)
         results[t] = {'deg': deg, 'genes': genes, 'n': len(genes)}
         logger.info(f'  DEGs @{t}: {len(genes)}')
@@ -232,7 +139,7 @@ def process_gse104036_temporal(counts_df):
     meta_all = pd.DataFrame(index=sample_cols)
     meta_all['condition'] = ['Sham'] * len(sham_cols) + ['Ipsilateral'] * len(all_time_ipsi)
     logger.info(f'  [GSE104036_all] Sham={len(sham_cols)}, Ipsi={len(all_time_ipsi)}')
-    deg_all = deg_rnaseq_pydeseq2(counts_df, meta_all, 'Ipsilateral', 'Sham')
+    deg_all = GEODataProcessor.deg_rnaseq_pydeseq2(counts_df, meta_all, 'Ipsilateral', 'Sham')
     genes_all = filter_deg(deg_all)
     results['all'] = {'deg': deg_all, 'genes': genes_all, 'n': len(genes_all)}
     logger.info(f'  DEGs @all: {len(genes_all)}')
