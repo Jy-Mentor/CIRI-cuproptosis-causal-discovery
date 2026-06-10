@@ -5,6 +5,7 @@ __pycache__/
 .env
 .venv
 conda_envs/
+eqtl_env/
 
 # Large data directories
 D:/
