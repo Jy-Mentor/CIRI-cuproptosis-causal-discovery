@@ -214,6 +214,39 @@ def parse_gpl6883_annotation(annot_path: str) -> Dict[str, str]:
     logger.info(f"  GPL6883: {len(probe_map)} 探针注释")
     return probe_map
 
+
+def parse_gpl1355_annotation(filepath: str) -> Dict[str, str]:
+    """解析 GPL1355 平台注释 (大鼠)"""
+    probe_map = {}
+    if not os.path.exists(filepath):
+        logger.warning(f"  GPL1355 文件不存在: {filepath}")
+        return probe_map
+    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+        in_table = False
+        for line in f:
+            l = line.strip()
+            if l.startswith('ID'):
+                in_table = True
+                header = l.split('\t')
+                try:
+                    gene_col = next(i for i, h in enumerate(header)
+                                    if 'gene symbol' in h.lower() or 'symbol' in h.lower())
+                except StopIteration:
+                    gene_col = 5
+                continue
+            if not in_table or not l:
+                continue
+            fields = l.split('\t')
+            if len(fields) <= max(gene_col, 0):
+                continue
+            probe = fields[0]
+            gene = fields[gene_col].strip('"').strip()
+            if gene:
+                probe_map[probe] = gene.split('///')[0].strip().upper()
+    logger.info(f"  GPL1355: {len(probe_map)} 探针注释")
+    return probe_map
+
+
 def collapse_probes(expr_df: pd.DataFrame, probe_map: Dict[str, str]) -> pd.DataFrame:
     """探针→基因折叠 (最大表达值, 大写)"""
     mapped = expr_df[expr_df.index.isin(probe_map.keys())].copy()
@@ -352,8 +385,12 @@ def calc_idsp_index(ferr_score: pd.Series, sene_score: pd.Series) -> pd.Series:
 
     含义: 两个得分都高且差异小时 → IDSP Index 最大
     """
-    z_ferr = (ferr_score - ferr_score.mean()) / ferr_score.std()
-    z_sene = (sene_score - sene_score.mean()) / sene_score.std()
+    ferr_std = ferr_score.std()
+    sene_std = sene_score.std()
+    z_ferr = ((ferr_score - ferr_score.mean()) / ferr_std
+              if ferr_std != 0 else pd.Series(0.0, index=ferr_score.index))
+    z_sene = ((sene_score - sene_score.mean()) / sene_std
+              if sene_std != 0 else pd.Series(0.0, index=sene_score.index))
     return z_ferr + z_sene - np.abs(z_ferr - z_sene)
 
 
@@ -381,9 +418,13 @@ def gpx4_validation(expr_df: pd.DataFrame, scores_df: pd.DataFrame,
     if len(scores) < 6:
         return {'dataset': dataset_name, 'gpx4_found': True, 'n_too_small': True}
 
-    # 按IDSP Index分高/低组 (四分位数, Top 25% vs Bottom 25%)
-    q75 = scores['idsp_index'].quantile(0.75)
-    q25 = scores['idsp_index'].quantile(0.25)
+    # 按IDSP Index分高/低组 (四分位数, Top 25% vs Bottom 25%, NaN安全)
+    valid_idsp = scores['idsp_index'].dropna()
+    if len(valid_idsp) < 4:
+        return {'dataset': dataset_name, 'gpx4_found': True, 'n_too_small': True,
+                'gpx4_mean_high': np.nan, 'gpx4_mean_low': np.nan,
+                'gpx4_log2fc': np.nan, 'pvalue': np.nan, 'verdict': 'insufficient_samples'}
+    q75, q25 = valid_idsp.quantile(0.75), valid_idsp.quantile(0.25)
     high_idsp = scores[scores['idsp_index'] >= q75]['gpx4_expr'].values
     low_idsp = scores[scores['idsp_index'] <= q25]['gpx4_expr'].values
 
