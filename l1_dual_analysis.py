@@ -39,18 +39,70 @@ import pandas as pd
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
 
-# ============================================================
-# 导入三基因集
-# ============================================================
-sys.path.insert(0, str(Path(__file__).parent))
-from idsp_gene_sets import (
-    PURE_FERROPTOSIS, PURE_SENESCENCE, SHARED_GENES,
-    FERROPTOSIS_ALL, SENESCENCE_ALL
-)
-
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# 导入三基因集（带 fallback 保护）
+# ============================================================
+sys.path.insert(0, str(Path(__file__).parent))
+try:
+    from idsp_gene_sets import (
+        PURE_FERROPTOSIS, PURE_SENESCENCE, SHARED_GENES,
+        FERROPTOSIS_ALL, SENESCENCE_ALL
+    )
+    logger.info("基因集加载: idsp_gene_sets.py")
+except ImportError:
+    logger.warning("idsp_gene_sets.py 未找到, 使用内联定义")
+    # ---- 纯铁死亡基因 (FerrDb V2 核心) ----
+    PURE_FERROPTOSIS = {
+        'ACSL4', 'PTGS2', 'HMOX1', 'TFRC', 'SLC7A11', 'CHAC1', 'SLC3A2',
+        'FTH1', 'FTL', 'NFE2L2', 'GPX4', 'DPP4', 'ALOX5', 'ALOX12',
+        'SAT1', 'SLC40A1', 'STEAP3', 'CBS', 'CSE1L', 'HSPB1',
+        'VDAC2', 'VDAC3', 'GOT1', 'GCLC', 'GCLM', 'ABCC1', 'ABCC2',
+        'ATM', 'ATF3', 'ATF4', 'DDIT3', 'SESN2', 'FANCD2', 'CDO1',
+        'ZEB1', 'SNAI1', 'MMP9', 'RGS4', 'SQSTM1', 'NCOA4', 'BECN1',
+        'PRNP', 'ADIPOQ', 'PLIN2', 'LPIN1', 'LPIN2', 'PNPLA2',
+        'MAP1LC3A', 'MAP1LC3B', 'GABARAP', 'GABARAPL1',
+        'ATG3', 'ATG5', 'ATG7', 'BAP1', 'TRIB3', 'KEAP1',
+        'TFAM', 'PPARGC1A', 'SIRT1', 'FOXO1', 'FOXO3',
+        'PRKAA1', 'PRKAA2', 'NFKB1', 'RELA', 'BNIP3', 'BNIP3L',
+        'HSP90AA1', 'HSPA5', 'HSPB1', 'HSPD1', 'EIF2AK3', 'EIF2A',
+    }
+    # ---- 纯衰老基因 (CellAge + SenMayo 核心) ----
+    PURE_SENESCENCE = {
+        'CDKN2A', 'CDKN2B', 'CDKN1A', 'CDKN1B', 'RB1', 'E2F1', 'E2F2',
+        'E2F3', 'CCND1', 'CCNE1', 'CCNA2', 'CCNB1', 'CDK4', 'CDK6',
+        'CDK2', 'TP53', 'MDM2', 'MDM4', 'CHEK1', 'CHEK2',
+        'ATM', 'ATR', 'H2AX', 'GADD45A', 'GADD45B', 'SERPINE1',
+        'IGFBP3', 'IGFBP5', 'IGFBP7', 'IL6', 'IL1A', 'IL1B',
+        'CCL2', 'CCL3', 'CCL4', 'CXCL1', 'CXCL2', 'CXCL10',
+        'MMP1', 'MMP2', 'MMP3', 'MMP10', 'MMP12', 'MMP13',
+        'TIMP1', 'TIMP2', 'FN1', 'COL1A1', 'COL1A2', 'COL3A1',
+        'LMNB1', 'HMGB1', 'HMGA1', 'HMGA2', 'SIRT6',
+        'FOXO4', 'STAT3', 'JAK2', 'MAPK1', 'MAPK3', 'MAPK8',
+        'MAPK14', 'AKT1', 'MTOR', 'RPS6KB1', 'PTEN', 'TSC1', 'TSC2',
+        'CREB1', 'ATF2', 'JUN', 'FOS', 'MYC', 'MAX', 'MNT',
+        'HDAC1', 'HDAC2', 'HDAC3', 'EP300', 'CREBBP', 'BRD4',
+        'PARP1', 'BUB1B', 'BUB1', 'BUB3', 'CDC20', 'MAD2L1',
+        'PLK1', 'AURKA', 'AURKB', 'TOP2A', 'MKI67', 'PCNA',
+        'MCM2', 'MCM3', 'MCM4', 'MCM5', 'MCM6', 'MCM7',
+        'RFC1', 'RFC2', 'RFC3', 'RFC4', 'RFC5',
+        'RPA1', 'RPA2', 'RPA3', 'LIG1', 'LIG3', 'LIG4',
+        'XRCC1', 'XRCC6', 'XRCC5', 'PRKDC', 'NBN', 'MRE11',
+        'RAD50', 'RAD51', 'BRCA1', 'BRCA2', 'BLM', 'WRN',
+        'TERF1', 'TERF2', 'TERT', 'CD38', 'CD4', 'CD8A',
+        'CSF2', 'CSF3', 'IFNG', 'TNF', 'TGFB1', 'VEGFA',
+        'ICAM1', 'VCAM1', 'SELE', 'IL18', 'IL10', 'TNFRSF1A',
+    }
+    SHARED_GENES = {
+        'TP53', 'CDKN1A', 'RB1', 'CD74', 'S100A8', 'IFNG',
+        'IRF1', 'TLR4', 'NLRP3', 'HIF1A', 'KEAP1', 'SOD1',
+    }
+    FERROPTOSIS_ALL = PURE_FERROPTOSIS | SHARED_GENES
+    SENESCENCE_ALL = PURE_SENESCENCE | SHARED_GENES
+    logger.info(f"内联基因集: 铁死亡={len(PURE_FERROPTOSIS)}, 衰老={len(PURE_SENESCENCE)}, 共享={len(SHARED_GENES)}")
 
 # ============================================================
 # 路径配置
@@ -137,31 +189,30 @@ def parse_series_matrix(filepath: str) -> pd.DataFrame:
     logger.info(f"  解析 {os.path.basename(filepath)}: {df.shape}")
     return df
 
-def parse_gpl1355_annotation(filepath: str) -> Dict[str, str]:
+def parse_gpl6883_annotation(annot_path: str) -> Dict[str, str]:
+    """解析 GPL6883 平台注释 (通用)"""
     probe_map = {}
-    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+    if not os.path.exists(annot_path):
+        return probe_map
+    with gzip.open(annot_path, 'rt', encoding='latin-1') as f:
         in_table = False
         for line in f:
             l = line.strip()
-            if l.startswith('ID'):
+            if l == '!platform_table_begin':
                 in_table = True
-                header = l.split('\t')
-                try:
-                    gene_col = next(i for i, h in enumerate(header)
-                                    if 'gene symbol' in h.lower() or 'symbol' in h.lower())
-                except StopIteration:
-                    gene_col = 5
+                header = f.readline().strip().split('\t')
+                gs_idx = next((i for i, h in enumerate(header)
+                                if 'gene symbol' in h.lower()), 2)
                 continue
-            if not in_table or not l:
+            if not in_table or l == '':
                 continue
             fields = l.split('\t')
-            if len(fields) <= max(gene_col, 0):
-                continue
-            probe = fields[0]
-            gene = fields[gene_col].strip('"').strip()
-            if gene and gene != '':
-                probe_map[probe] = gene.split('///')[0].strip()
-    logger.info(f"  GPL1355: {len(probe_map)} 探针注释")
+            if len(fields) > gs_idx:
+                probe = fields[0].strip('"').strip()
+                gene = fields[gs_idx].strip('"').strip().upper()
+                if gene:
+                    probe_map[probe] = gene
+    logger.info(f"  GPL6883: {len(probe_map)} 探针注释")
     return probe_map
 
 def collapse_probes(expr_df: pd.DataFrame, probe_map: Dict[str, str]) -> pd.DataFrame:
@@ -228,6 +279,17 @@ def dual_enrichment_analysis(expr_df: pd.DataFrame, dataset_name: str,
         scores_df: 每个样本的三维评分
         comparison: 区分度统计字典
     """
+    # 检查基因集交集是否足够
+    for gname, gset in [('Ferroptosis', PURE_FERROPTOSIS), ('Senescence', PURE_SENESCENCE)]:
+        common = sum(1 for g in gset if g in expr_df.index)
+        if common < 5:
+            logger.warning(f"  [{dataset_name}] {gname} 交集={common} < 5, 跳过")
+            empty_scores = pd.DataFrame(columns=['ferroptosis','senescence','shared','dataset','sample','group','idsp_index'])
+            empty_comp = {'dataset': dataset_name, 'n_case': 0, 'n_control': 0, 'r_ferr_sene': np.nan,
+                          'd_ferroptosis': np.nan, 'd_senescence': np.nan, 'd_idsp': np.nan,
+                          'p_ferroptosis': np.nan, 'p_senescence': np.nan, 'p_idsp': np.nan}
+            return empty_scores, empty_comp
+
     # 计算三个评分
     ferr_score = compute_enrichment_score_matrix(expr_df, PURE_FERROPTOSIS)
     sene_score = compute_enrichment_score_matrix(expr_df, PURE_SENESCENCE)
@@ -319,10 +381,16 @@ def gpx4_validation(expr_df: pd.DataFrame, scores_df: pd.DataFrame,
     if len(scores) < 6:
         return {'dataset': dataset_name, 'gpx4_found': True, 'n_too_small': True}
 
-    # 按IDSP Index分高/低组
-    median_idsp = scores['idsp_index'].median()
-    high_idsp = scores[scores['idsp_index'] >= median_idsp]['gpx4_expr'].values
-    low_idsp = scores[scores['idsp_index'] < median_idsp]['gpx4_expr'].values
+    # 按IDSP Index分高/低组 (四分位数, Top 25% vs Bottom 25%)
+    q75 = scores['idsp_index'].quantile(0.75)
+    q25 = scores['idsp_index'].quantile(0.25)
+    high_idsp = scores[scores['idsp_index'] >= q75]['gpx4_expr'].values
+    low_idsp = scores[scores['idsp_index'] <= q25]['gpx4_expr'].values
+
+    if len(high_idsp) < 2 or len(low_idsp) < 2:
+        return {'dataset': dataset_name, 'gpx4_found': True, 'n_too_small': True,
+                'gpx4_mean_high': np.nan, 'gpx4_mean_low': np.nan,
+                'gpx4_log2fc': np.nan, 'pvalue': np.nan, 'verdict': 'insufficient_samples'}
 
     # t检验: 高IDSP vs 低IDSP 的GPX4
     _, pval = stats.ttest_ind(high_idsp, low_idsp, equal_var=False)
@@ -596,10 +664,11 @@ def _load_expr_gse104036() -> Tuple[pd.DataFrame, dict, List[str]]:
     expr_df.index = expr_df.index.str.upper()
     logger.info(f"  矩阵: {expr_df.shape}")
 
-    # 判断是否需要log转换
+    # 判断是否需要log转换 (浮点容差检查)
     flat = expr_df.values.flatten()
     flat = flat[~np.isnan(flat)]
-    if len(flat) > 0 and np.max(flat) > 50 and np.median(flat) > 5 and np.mean(flat == np.floor(flat)) > 0.5:
+    int_ratio = np.mean(np.abs(flat - np.round(flat)) < 1e-8) if len(flat) > 0 else 0
+    if len(flat) > 0 and np.max(flat) > 50 and np.median(flat) > 5 and int_ratio > 0.5:
         logger.info("  raw counts检测, 执行log2(CPM+1)")
         col_sums = expr_df.sum()
         cpm = expr_df.div(col_sums, axis=1) * 1e6
@@ -626,6 +695,9 @@ def temporal_dual_analysis(expr_df: pd.DataFrame, timepoint_dict: dict,
                             sham_cols: List[str], dataset_name: str) -> pd.DataFrame:
     """
     时间动态双评分分析
+
+    注意: 此处重新计算富集评分而非复用 main() 中的结果,
+    是为保持函数独立性. 因数据量小, 重复计算开销可忽略.
 
     预期:
       铁死亡: 3h↑ → 6h达峰 → 12h↓ → 24h继续↓ (急性脉冲)
@@ -671,7 +743,7 @@ def temporal_dual_analysis(expr_df: pd.DataFrame, timepoint_dict: dict,
     results.append({
         'dataset': dataset_name,
         'timepoint': 'Sham',
-        'time_hr': 0,
+        'time_hr': -0.5,
         'n_samples': len(sham_cols),
         'ferroptosis_mean': sham_ferr.mean(),
         'ferroptosis_sem': sham_ferr.std() / np.sqrt(len(sham_ferr.dropna())),
@@ -689,10 +761,16 @@ def temporal_dual_analysis(expr_df: pd.DataFrame, timepoint_dict: dict,
 # ============================================================
 
 def plot_forest_dual(comparisons: List[dict], save_path: str):
-    """双评分效应量森林图"""
-    ds_names = [c['dataset'] for c in comparisons]
-    d_ferr = [c['d_ferroptosis'] for c in comparisons]
-    d_sene = [c['d_senescence'] for c in comparisons]
+    """双评分效应量森林图 (自动过滤NaN)"""
+    valid_comp = [c for c in comparisons if not (np.isnan(c.get('d_ferroptosis', np.nan)) or
+                                                  np.isnan(c.get('d_senescence', np.nan)))]
+    if not valid_comp:
+        logger.warning("  森林图: 无有效数据, 跳过")
+        return
+
+    ds_names = [c['dataset'] for c in valid_comp]
+    d_ferr = [c['d_ferroptosis'] for c in valid_comp]
+    d_sene = [c['d_senescence'] for c in valid_comp]
 
     fig, ax = plt.subplots(figsize=(8, 4))
     y = np.arange(len(ds_names))
@@ -729,6 +807,12 @@ def plot_temporal_dual(temporal_df: pd.DataFrame, save_path: str):
                  fmt='o-', color=color_ferr, capsize=4, label='Ferroptosis', markersize=8)
     ax2.errorbar(x, df['senescence_mean'], yerr=df['senescence_sem'],
                  fmt='s--', color=color_sene, capsize=4, label='Senescence', markersize=8)
+
+    # 用虚线分隔Sham基线
+    if -0.5 in x:
+        ax1.axvline(x=0, color='gray', ls=':', lw=1, alpha=0.6)
+        ax1.text(-0.5, ax1.get_ylim()[1]*0.95, 'Sham', ha='center', fontsize=9,
+                 style='italic', bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgray', alpha=0.5))
 
     ax1.set_xlabel('Time (hours post-MCAO)')
     ax1.set_ylabel('Ferroptosis Score', color=color_ferr)
