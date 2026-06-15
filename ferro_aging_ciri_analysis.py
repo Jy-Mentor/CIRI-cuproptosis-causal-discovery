@@ -32,7 +32,7 @@
 =============================================================================
 """
 
-import os, sys, gzip, json, warnings, logging
+import os, re, sys, gzip, json, warnings, logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 
@@ -126,7 +126,6 @@ FERRO_AGING_GENES = [
 
 # 核对: 8个分类 + 1个补充 = 96+ 基因
 assert len(set(FERRO_AGING_GENES)) == len(FERRO_AGING_GENES), "存在重复基因！"
-print(f"[INFO] 铁衰老基因集: {len(set(FERRO_AGING_GENES))} 个唯一基因")
 
 # 核心铁衰老标志基因 (基于新基因集的关键标志)
 CORE_FERRO_AGING_GENES = [
@@ -135,7 +134,7 @@ CORE_FERRO_AGING_GENES = [
     "CDKN1A", "ALOX15", "NLRP3", "TLR4", "MPO"
 ]
 
-logger.info(f"铁衰老基因集: {len(FERRO_AGING_GENES)} 基因")
+logger.info(f"铁衰老基因集定义完成: {len(set(FERRO_AGING_GENES))} 个唯一基因")
 logger.info(f"核心标志基因: {len(CORE_FERRO_AGING_GENES)}")
 
 
@@ -231,9 +230,13 @@ def analyze_signature_genes(
     control_cols: List[str],
     gene_set: Set[str],
     dataset_name: str,
+    paired: bool = False,
 ) -> pd.DataFrame:
     """
     分析铁衰老基因集中每个基因在两组间的差异表达
+    
+    Args:
+        paired: 是否使用配对t检验 (需case_cols/control_cols顺序对齐)
     
     Returns:
         DataFrame: [gene, mean_case, mean_control, log2FC, pvalue, padj]
@@ -250,6 +253,16 @@ def analyze_signature_genes(
         if len(case_vals) < 2 or len(ctrl_vals) < 2:
             continue
         
+        # 对于配对检验, 需对齐有效值对
+        if paired:
+            paired_case = expr_df.loc[gene, case_cols].values.astype(float)
+            paired_ctrl = expr_df.loc[gene, control_cols].values.astype(float)
+            valid = ~(np.isnan(paired_case) | np.isnan(paired_ctrl))
+            if valid.sum() < 3:
+                continue
+            case_vals = paired_case[valid]
+            ctrl_vals = paired_ctrl[valid]
+        
         mean_case = np.mean(case_vals)
         mean_ctrl = np.mean(ctrl_vals)
         
@@ -257,7 +270,10 @@ def analyze_signature_genes(
         log2fc = mean_case - mean_ctrl
         
         # t检验
-        _, pval = stats.ttest_ind(case_vals, ctrl_vals, equal_var=False)
+        if paired and len(case_vals) == len(ctrl_vals) and len(case_vals) >= 3:
+            _, pval = stats.ttest_rel(case_vals, ctrl_vals)
+        else:
+            _, pval = stats.ttest_ind(case_vals, ctrl_vals, equal_var=False)
         
         results.append({
             'dataset': dataset_name,
@@ -308,12 +324,13 @@ def fisher_meta_analysis(p_values: List[float]) -> Tuple[float, float]:
 # ============================================================
 
 def find_file(dir_path: str, keywords: List[str]) -> Optional[str]:
-    """在目录中查找包含关键字的文件"""
+    """在目录中查找包含关键字的文件 (递归搜索子目录)"""
     if not os.path.isdir(dir_path):
         return None
-    for f in os.listdir(dir_path):
-        if all(k.lower() in f.lower() for k in keywords):
-            return os.path.join(dir_path, f)
+    for root, dirs, files in os.walk(dir_path):
+        for f in files:
+            if all(k.lower() in f.lower() for k in keywords):
+                return os.path.join(root, f)
     return None
 
 
@@ -400,8 +417,14 @@ def collapse_probes(expr_df: pd.DataFrame, probe_map: Dict[str, str]) -> pd.Data
     mapped = expr_df[expr_df.index.isin(probe_map.keys())].copy()
     if mapped.empty:
         return expr_df
+    n_mapped = mapped.shape[0]
     gene_series = pd.Series(mapped.index.map(probe_map), index=mapped.index)
-    gene_series = gene_series.fillna(gene_series.index.to_series())
+    # 未映射探针用NaN填充 (不再用探针ID当基因名)
+    unmapped_count = gene_series.isna().sum()
+    if unmapped_count > 0:
+        logger.debug(f"  {unmapped_count}/{n_mapped} 探针无基因映射, 已过滤")
+    gene_series = gene_series.dropna()
+    mapped = mapped.loc[gene_series.index]
     # 转大写实现跨物种大小写不敏感匹配
     gene_series = gene_series.str.upper()
     mapped.index = gene_series
@@ -438,6 +461,10 @@ def process_gse16561() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     
     stroke_cols = []
     control_cols = []
+    if sample_line is None:
+        raise ValueError("GSE16561 series_matrix 中未找到 !Sample_geo_accession")
+    if desc_line is None:
+        raise ValueError("GSE16561 series_matrix 中未找到 !Sample_description")
     for i, gsm in enumerate(sample_line[1:], 1):
         gsm = gsm.strip('"').strip()
         desc = desc_line[i].strip('"').strip() if i < len(desc_line) else ''
@@ -462,11 +489,8 @@ def process_gse16561() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
                 if l == '!platform_table_begin':
                     in_table = True
                     header = f.readline().strip().split('\t')
-                    gs_idx = 2
-                    if 'Gene symbol' in header:
-                        gs_idx = header.index('Gene symbol')
-                    elif 'Symbol' in header:
-                        gs_idx = header.index('Symbol')
+                    gs_idx = next((i for i, h in enumerate(header) 
+                                    if 'gene symbol' in h.lower() or 'symbol' in h.lower()), 2)
                     continue
                 if not in_table or l == '':
                     continue
@@ -501,8 +525,10 @@ def process_gse16561() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         'case_label': 'Stroke', 'control_label': 'Control',
         'n_case': len(case_scores), 'n_control': len(ctrl_scores),
         'mean_case': case_scores.mean(), 'mean_control': ctrl_scores.mean(),
+        'std_case': float(case_scores.std()) if len(case_scores) > 1 else 0.0,
+        'std_control': float(ctrl_scores.std()) if len(ctrl_scores) > 1 else 0.0,
         'mean_diff': mean_diff, 'pvalue': pval,
-    })
+    }), list(stroke_cols), list(control_cols)
 
 
 # ============================================================
@@ -520,7 +546,7 @@ def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     
     expr_df = parse_series_matrix(sm_file)
     
-    # 用GSM列名精确匹配 (GSE37587的列名包含GSM号)
+    # 用GSM列名精确匹配
     with gzip.open(sm_file, 'rt', encoding='latin-1') as f:
         lines = f.readlines()
     
@@ -535,33 +561,35 @@ def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         if l.startswith('!Sample_description'):
             desc_line = [x.strip('"').strip() for x in l.strip().split('\t')]
     
-    # 列名 = GSM ID
-    cols_by_sample = {}
-    for i, gsm in enumerate(sample_line[1:], 1):
-        title = title_line[i] if i < len(title_line) else ''
-        desc = desc_line[i] if i < len(desc_line) else ''
-        cols_by_sample[gsm] = {'title': title, 'desc': desc}
-        logger.debug(f"  {gsm}: title={title}, desc={desc}")
-    
+    # 从description解析分组和配对信息, 避免title中数字干扰
     followup_cols = []
     baseline_cols = []
-    for gsm, info in cols_by_sample.items():
-        title_lower = info['title'].lower()
-        desc_lower = info['desc'].lower()
-        # 检查是否为follow-up/后续时间点
-        if any(kw in title_lower for kw in ['follow', 'fu', '24', '48', '72']):
-            followup_cols.append(gsm)
-        elif any(kw in title_lower for kw in ['baseline', 'base', '00', '0h', 'hour 0', '0 hour', 'control']):
-            baseline_cols.append(gsm)
-        # 如果从title无法区分, 用number判断
-        elif 'patient' in desc_lower:
-            # 从description看
-            if any(kw in desc_lower for kw in ['follow', 'hour 24', 'hour 48']):
-                followup_cols.append(gsm)
-            elif any(kw in desc_lower for kw in ['baseline', 'hour 0', '0 hour']):
-                baseline_cols.append(gsm)
+    patient_pairs = []  # patient_id -> group -> gsm
     
-    # 去重
+    for i, gsm in enumerate(sample_line[1:], 1):
+        desc = desc_line[i] if i < len(desc_line) else ''
+        desc_lower = desc.lower()
+        
+        # 从description判断分组
+        is_baseline = any(kw in desc_lower for kw in ['baseline', 'hour 0', '0 hour'])
+        is_followup = any(kw in desc_lower for kw in ['follow-up', 'follow up', 'followup',
+                                                        'hour 24', 'hour 48', 'hour 72'])
+        
+        # 提取患者ID用于配对
+        patient_match = re.search(r'[Pp]atient\s+(\d+)', desc)
+        patient_id = patient_match.group(1) if patient_match else None
+        
+        if is_baseline:
+            baseline_cols.append(gsm)
+            if patient_id:
+                patient_pairs.append({'patient': patient_id, 'group': 'baseline', 'gsm': gsm})
+        elif is_followup:
+            followup_cols.append(gsm)
+            if patient_id:
+                patient_pairs.append({'patient': patient_id, 'group': 'followup', 'gsm': gsm})
+        else:
+            logger.warning(f"  无法识别分组: {gsm} desc={desc[:80]}")
+    
     followup_cols = list(dict.fromkeys([c for c in followup_cols if c in expr_df.columns]))
     baseline_cols = list(dict.fromkeys([c for c in baseline_cols if c in expr_df.columns]))
     
@@ -577,7 +605,8 @@ def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
                 if l == '!platform_table_begin':
                     in_table = True
                     header = f.readline().strip().split('\t')
-                    gs_idx = header.index('Gene symbol') if 'Gene symbol' in header else 2
+                    gs_idx = next((i for i, h in enumerate(header) 
+                                    if 'gene symbol' in h.lower() or 'symbol' in h.lower()), 2)
                     continue
                 if not in_table or l == '':
                     continue
@@ -592,24 +621,50 @@ def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     # ssGSEA
     fa_score = compute_ssgsea_matrix(expr_gene, set(FERRO_AGING_GENES))
     
-    # 配对检验
     case_scores = fa_score[[c for c in followup_cols if c in fa_score.index]].dropna()
     ctrl_scores = fa_score[[c for c in baseline_cols if c in fa_score.index]].dropna()
-    _, pval = stats.ttest_ind(case_scores, ctrl_scores, equal_var=False)
+    
+    # 配对t检验 (优先, 因实验设计为配对)
+    pval = None
+    pair_df = pd.DataFrame(patient_pairs)
+    if not pair_df.empty:
+        baseline_map = pair_df[pair_df['group']=='baseline'].set_index('patient')['gsm'].to_dict()
+        followup_map = pair_df[pair_df['group']=='followup'].set_index('patient')['gsm'].to_dict()
+        common_patients = sorted(set(baseline_map.keys()) & set(followup_map.keys()))
+        
+        if len(common_patients) >= 3:
+            bl_scores = [fa_score.get(baseline_map[p], np.nan) for p in common_patients]
+            fu_scores = [fa_score.get(followup_map[p], np.nan) for p in common_patients]
+            valid = [(b, f) for b, f in zip(bl_scores, fu_scores)
+                     if not np.isnan(b) and not np.isnan(f)]
+            if len(valid) >= 3:
+                bl_arr = np.array([v[0] for v in valid])
+                fu_arr = np.array([v[1] for v in valid])
+                _, pval_paired = stats.ttest_rel(bl_arr, fu_arr)
+                pval = pval_paired
+                logger.info(f"  配对t检验: n_pairs={len(valid)}, p={pval_paired:.4e}")
+    
+    # 如果配对检验不可行, 用非配对检验
+    if pval is None:
+        _, pval = stats.ttest_ind(case_scores, ctrl_scores, equal_var=False)
+    
     mean_diff = case_scores.mean() - ctrl_scores.mean()
     logger.info(f"  Ferro-aging评分: FU={case_scores.mean():.3f}, "
                 f"BL={ctrl_scores.mean():.3f}, Δ={mean_diff:.3f}, p={pval:.4e}")
     
     gene_df = analyze_signature_genes(expr_gene, followup_cols, baseline_cols,
-                                       set(FERRO_AGING_GENES), 'GSE37587')
+                                       set(FERRO_AGING_GENES), 'GSE37587',
+                                       paired=True)
     
     return fa_score, gene_df, pd.Series({
         'dataset': 'GSE37587', 'species': 'Human', 'tissue': 'Whole Blood',
         'case_label': 'Follow-Up', 'control_label': 'Baseline',
         'n_case': len(case_scores), 'n_control': len(ctrl_scores),
         'mean_case': case_scores.mean(), 'mean_control': ctrl_scores.mean(),
+        'std_case': float(case_scores.std()) if len(case_scores) > 1 else 0.0,
+        'std_control': float(ctrl_scores.std()) if len(ctrl_scores) > 1 else 0.0,
         'mean_diff': mean_diff, 'pvalue': pval,
-    })
+    }), list(followup_cols), list(baseline_cols)
 
 
 # ============================================================
@@ -627,9 +682,24 @@ def process_gse61616() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     
     expr_df = parse_series_matrix(sm_file)
     
-    # 样本分组
-    sham_cols = ['GSM1509422', 'GSM1509423', 'GSM1509424', 'GSM1509425', 'GSM1509426']
-    model_cols = ['GSM1509427', 'GSM1509428', 'GSM1509429', 'GSM1509430', 'GSM1509431']
+    # 动态解析样本分组 (替代硬编码GSM ID)
+    with gzip.open(sm_file, 'rt', encoding='latin-1') as f:
+        lines = f.readlines()
+    sample_acc = None
+    sample_title = None
+    for l in lines:
+        if l.startswith('!Sample_geo_accession'):
+            sample_acc = [x.strip('"').strip() for x in l.strip().split('\t')]
+        if l.startswith('!Sample_title'):
+            sample_title = [x.strip('"').strip() for x in l.strip().split('\t')]
+    sham_cols = []
+    model_cols = []
+    for i, gsm in enumerate(sample_acc[1:], 1):
+        title = sample_title[i].lower() if i < len(sample_title) else ''
+        if 'sham' in title:
+            sham_cols.append(gsm)
+        elif any(kw in title for kw in ['mcao', 'model', 'stroke']):
+            model_cols.append(gsm)
     sham_cols = [c for c in sham_cols if c in expr_df.columns]
     model_cols = [c for c in model_cols if c in expr_df.columns]
     logger.info(f"  Model={len(model_cols)}, Sham={len(sham_cols)}")
@@ -658,8 +728,10 @@ def process_gse61616() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         'case_label': 'MCAO 7d', 'control_label': 'Sham',
         'n_case': len(case_scores), 'n_control': len(ctrl_scores),
         'mean_case': case_scores.mean(), 'mean_control': ctrl_scores.mean(),
+        'std_case': float(case_scores.std()) if len(case_scores) > 1 else 0.0,
+        'std_control': float(ctrl_scores.std()) if len(ctrl_scores) > 1 else 0.0,
         'mean_diff': mean_diff, 'pvalue': pval,
-    })
+    }), list(model_cols), list(sham_cols)
 
 
 # ============================================================
@@ -677,9 +749,24 @@ def process_gse97537() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     
     expr_df = parse_series_matrix(sm_file)
     
-    sham_cols = ['GSM2571742', 'GSM2571743', 'GSM2571744', 'GSM2571745', 'GSM2571746']
-    mcao_cols = ['GSM2571735', 'GSM2571736', 'GSM2571737', 'GSM2571738',
-                  'GSM2571739', 'GSM2571740', 'GSM2571741']
+    # 动态解析样本分组 (替代硬编码GSM ID)
+    with gzip.open(sm_file, 'rt', encoding='latin-1') as f:
+        lines = f.readlines()
+    sample_acc = None
+    sample_title = None
+    for l in lines:
+        if l.startswith('!Sample_geo_accession'):
+            sample_acc = [x.strip('"').strip() for x in l.strip().split('\t')]
+        if l.startswith('!Sample_title'):
+            sample_title = [x.strip('"').strip() for x in l.strip().split('\t')]
+    sham_cols = []
+    mcao_cols = []
+    for i, gsm in enumerate(sample_acc[1:], 1):
+        title = sample_title[i].lower() if i < len(sample_title) else ''
+        if 'sham' in title:
+            sham_cols.append(gsm)
+        elif any(kw in title for kw in ['mcao', 'model', 'stroke']):
+            mcao_cols.append(gsm)
     sham_cols = [c for c in sham_cols if c in expr_df.columns]
     mcao_cols = [c for c in mcao_cols if c in expr_df.columns]
     logger.info(f"  MCAO={len(mcao_cols)}, Sham={len(sham_cols)}")
@@ -706,8 +793,10 @@ def process_gse97537() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         'case_label': 'MCAO 24h', 'control_label': 'Sham',
         'n_case': len(case_scores), 'n_control': len(ctrl_scores),
         'mean_case': case_scores.mean(), 'mean_control': ctrl_scores.mean(),
+        'std_case': float(case_scores.std()) if len(case_scores) > 1 else 0.0,
+        'std_control': float(ctrl_scores.std()) if len(ctrl_scores) > 1 else 0.0,
         'mean_diff': mean_diff, 'pvalue': pval,
-    })
+    }), list(mcao_cols), list(sham_cols)
 
 
 # ============================================================
@@ -747,29 +836,20 @@ def process_gse104036() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     
     logger.info(f"  矩阵: {expr_df.shape}")
     
-    # 样本分组
-    # ipsi = 缺血侧, contra = 对侧
-    sham_cols = ['S1', 'S2', 'S3']
-    ipso_3hr = ['I1_3hr', 'I2_3hr', 'I3_3hr']
-    ipso_6hr = ['I1_6hr', 'I2_6hr', 'I3_6hr']
-    ipso_12hr = ['I1_12hr', 'I2_12hr', 'I3_12hr']
-    ipso_24hr = ['I1_24hr', 'I2_24hr', 'I3_24hr']
-    
-    # 从列名中匹配
+    # 样本分组: 使用模糊匹配替代硬编码
+    # 列名格式: S1, S2, S3 (sham) | I1_3hr, I2_6hr, I3_24hr (ipsilateral)
     all_cols = expr_df.columns.tolist()
-    sham_cols = [c for c in all_cols if c in sham_cols]
-    ipso_3hr = [c for c in all_cols if c in ipso_3hr]
-    ipso_6hr = [c for c in all_cols if c in ipso_6hr]
-    ipso_12hr = [c for c in all_cols if c in ipso_12hr]
-    ipso_24hr = [c for c in all_cols if c in ipso_24hr]
+    logger.info(f"  列名: {all_cols}")
+    
+    sham_cols = sorted([c for c in all_cols 
+                        if re.match(r'^S\d+', str(c)) or 'sham' in str(c).lower()])
+    ipso_3hr = sorted([c for c in all_cols if re.match(r'^I\d+.*3h', str(c), re.IGNORECASE)])
+    ipso_6hr = sorted([c for c in all_cols if re.match(r'^I\d+.*6h', str(c), re.IGNORECASE)])
+    ipso_12hr = sorted([c for c in all_cols if re.match(r'^I\d+.*12h', str(c), re.IGNORECASE)])
+    ipso_24hr = sorted([c for c in all_cols if re.match(r'^I\d+.*24h', str(c), re.IGNORECASE)])
     
     # 合并所有ipsi时间点 vs sham
     ipsi_all = ipso_3hr + ipso_6hr + ipso_12hr + ipso_24hr
-    
-    # 如果列名不匹配, 尝试模糊匹配
-    if not sham_cols:
-        sham_cols = [c for c in all_cols if 'sham' in c.lower() or 's1' in c.lower() 
-                     or 's2' in c.lower() or 's3' in c.lower()]
     
     # RNA-seq数据: log2(CPM+1) 转换用于ssGSEA
     # 如果是count数据, 先归一化
@@ -819,11 +899,13 @@ def process_gse104036() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         'case_label': 'MCAO Ipsi', 'control_label': 'Sham',
         'n_case': len(case_scores), 'n_control': len(ctrl_scores),
         'mean_case': case_scores.mean(), 'mean_control': ctrl_scores.mean(),
+        'std_case': float(case_scores.std()) if len(case_scores) > 1 else 0.0,
+        'std_control': float(ctrl_scores.std()) if len(ctrl_scores) > 1 else 0.0,
         'mean_diff': mean_diff, 'pvalue': pval,
         'timepoints': json.dumps({k: {kk: float(vv) if isinstance(vv, np.floating) else vv 
                                        for kk, vv in v.items()} 
                                   for k, v in timepoint_results.items()}),
-    })
+    }), list(ipsi_all), list(sham_cols)
 
 
 # ============================================================
@@ -833,8 +915,9 @@ def process_gse104036() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
 def plot_ferro_aging_scores(
     all_scores: Dict[str, pd.Series],
     all_stats: Dict[str, pd.Series],
+    all_groups: Dict[str, Tuple[List[str], List[str]]],
 ):
-    """绘制各数据集的铁衰老评分箱线图"""
+    """绘制各数据集的铁衰老评分箱线图 (使用传入的case/control列名分组)"""
     n_datasets = len(all_scores)
     fig, axes = plt.subplots(1, n_datasets, figsize=(5 * n_datasets, 5))
     if n_datasets == 1:
@@ -842,38 +925,25 @@ def plot_ferro_aging_scores(
     
     colors = {'case': '#E74C3C', 'control': '#3498DB'}
     
-    for ax, (ds_name, scores) in zip(axes, all_scores.items()):
+    for ax, ds_name in zip(axes, all_scores.keys()):
+        scores = all_scores[ds_name]
         stat = all_stats.get(ds_name)
-        if stat is None:
+        groups = all_groups.get(ds_name)
+        if stat is None or groups is None:
             continue
         
-        # 找case和control的样本
+        case_cols, control_cols = groups
         case_label = stat.get('case_label', 'Case')
         ctrl_label = stat.get('control_label', 'Control')
         
-        # 从score中根据样本名判断分组
-        # 简化方法: 用预览的前几个字符判断
-        case_pattern = case_label.lower()[:4]
-        ctrl_pattern = ctrl_label.lower()[:4]
+        # 直接使用列名索引，不再做关键词匹配
+        case_vals = scores[case_cols].dropna().values.tolist() if case_cols else []
+        ctrl_vals = scores[control_cols].dropna().values.tolist() if control_cols else []
         
-        case_vals = []
-        ctrl_vals = []
-        case_names = []
-        ctrl_names = []
-        for sname in scores.index:
-            sname_clean = str(sname).strip('"').lower()
-            if any(kw in sname_clean for kw in [case_label.lower(), 'stroke', 'mcao', 
-                                                  'model', 'follow', 'ipsi']):
-                case_vals.append(scores[sname])
-                case_names.append(str(sname)[:15])
-            else:
-                ctrl_vals.append(scores[sname])
-                ctrl_names.append(str(sname)[:15])
-        
-        # 如果没有识别到, 用stats中的样本数推断
-        if not case_vals or not ctrl_vals:
-            # 前述方法可能不准, 改用存储的统计量画简图
+        # 如果都没有有效值，用统计量保底
+        if not case_vals:
             case_vals = [stat.get('mean_case', 0)]
+        if not ctrl_vals:
             ctrl_vals = [stat.get('mean_control', 0)]
         
         # 箱线图
@@ -891,21 +961,24 @@ def plot_ferro_aging_scores(
         np.random.seed(42)
         for pos, vals, color in [(0, ctrl_vals, colors['control']),
                                   (1, case_vals, colors['case'])]:
-            jitter = np.random.normal(0, 0.04, len(vals))
+            # 动态jitter (样本量越小, jitter越小)
+            jitter_scale = max(0.02, min(0.08, 0.25 / np.sqrt(len(vals))))
+            jitter = np.random.normal(0, jitter_scale, len(vals))
             ax.scatter(np.full_like(vals, pos) + jitter, vals,
                       alpha=0.7, s=30, color=color, edgecolors='white', 
                       linewidth=0.5, zorder=5)
         
-        # p值
+        # p值标注
         pval = stat.get('pvalue', 1.0)
         p_text = f"p = {pval:.2e}" if pval > 1e-99 else "p < 1e-99"
-        sig = '*' if pval < 0.05 else 'ns'
         if pval < 0.001:
             sig = '***'
         elif pval < 0.01:
             sig = '**'
         elif pval < 0.05:
             sig = '*'
+        else:
+            sig = 'ns'
         
         y_max = max(max(case_vals) if case_vals else 0, 
                     max(ctrl_vals) if ctrl_vals else 0)
@@ -913,11 +986,14 @@ def plot_ferro_aging_scores(
                     min(ctrl_vals) if ctrl_vals else 0)
         y_range = y_max - y_min if y_max != y_min else 1
         
+        # 显著性标注线
         ax.plot([0, 0, 1, 1], [y_max + y_range * 0.1, y_max + y_range * 0.15,
                                y_max + y_range * 0.15, y_max + y_range * 0.1],
                color='black', linewidth=1)
         ax.text(0.5, y_max + y_range * 0.18, f'{sig}\n{p_text}', 
-                ha='center', va='bottom', fontsize=9)
+                ha='center', va='bottom', fontsize=9,
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
+                          edgecolor='gray', alpha=0.8))
         
         # Labels
         ax.set_xticks([0, 1])
@@ -949,23 +1025,35 @@ def plot_forest_plot(meta_df: pd.DataFrame):
     y_positions = range(len(meta_df))
     
     for i, (_, row) in enumerate(meta_df.iterrows()):
+        is_meta = row.get('dataset', '') == 'META-ANALYSIS'
         mean = row.get('mean_diff', 0)
         pval = row.get('pvalue', 1)
-        # 近似95% CI
-        # 注意: 由于process函数未返回标准差信息, 此处使用p值反推近似CI
-        # 更严谨的做法应在process函数中返回每组的标准差, 再用
-        # SE = sqrt(s1^2/n1 + s2^2/n2) 计算标准误
-        # 当前近似方法供可视化趋势参考, 不作为统计推断依据
-        se = abs(mean) / max(-np.log10(max(pval, 1e-300)), 0.1) * 0.5 if pval > 0 else abs(mean) / 2
-        ci_low = mean - 1.96 * max(se, 0.01)
-        ci_high = mean + 1.96 * max(se, 0.01)
         
-        color = '#E74C3C' if mean > 0 else '#3498DB'
-        ax.scatter(mean, i, color=color, s=80, zorder=5)
-        ax.plot([ci_low, ci_high], [i, i], color=color, linewidth=2, zorder=4)
-        
-        p_text = f"{pval:.2e}" if pval > 0.001 else f"{pval:.1e}"
-        ax.text(ci_high + 0.05, i, f"  p={p_text}", va='center', fontsize=8)
+        if is_meta:
+            # META-ANALYSIS行: 使用菱形标记, 不画(无意义的)CI线
+            color = '#2C3E50'
+            ax.scatter(mean, i, marker='D', s=120, color=color, 
+                      edgecolors='white', linewidth=1.5, zorder=6)
+            p_text = f"Meta p={pval:.2e}" if pval > 0.001 else f"Meta p={pval:.1e}"
+            ax.text(mean + 0.08, i, p_text, va='center', fontsize=9,
+                   fontweight='bold', color=color)
+        else:
+            # 单数据集: 使用真实标准差计算95% CI
+            std_case = row.get('std_case', 0)
+            std_control = row.get('std_control', 0)
+            n_case = int(row.get('n_case', 3))
+            n_control = int(row.get('n_control', 3))
+            se = np.sqrt((max(std_case, 0)**2 / max(n_case, 1)) + 
+                         (max(std_control, 0)**2 / max(n_control, 1)))
+            ci_low = mean - 1.96 * max(se, 0.001)
+            ci_high = mean + 1.96 * max(se, 0.001)
+            
+            color = '#E74C3C' if mean > 0 else '#3498DB'
+            ax.scatter(mean, i, color=color, s=80, zorder=5)
+            ax.plot([ci_low, ci_high], [i, i], color=color, linewidth=2, zorder=4)
+            
+            p_text = f"{pval:.2e}" if pval > 0.001 else f"{pval:.1e}"
+            ax.text(ci_high + 0.05, i, f"  p={p_text}", va='center', fontsize=8)
     
     ax.axvline(x=0, color='black', linestyle='--', alpha=0.5)
     ax.set_yticks(list(y_positions))
@@ -996,6 +1084,7 @@ def main():
     all_scores = {}
     all_stats = {}
     all_gene_dfs = []
+    all_groups = {}  # {ds_name: (case_cols, control_cols)}
     
     # 处理每个数据集
     processors = [
@@ -1008,9 +1097,10 @@ def main():
     
     for ds_name, processor in processors:
         try:
-            scores, gene_df, stats_series = processor()
+            scores, gene_df, stats_series, case_cols, control_cols = processor()
             all_scores[ds_name] = scores
             all_stats[ds_name] = stats_series
+            all_groups[ds_name] = (case_cols, control_cols)
             all_gene_dfs.append(gene_df)
             logger.info(f"  ✓ {ds_name} 处理完成")
         except Exception as e:
@@ -1040,6 +1130,12 @@ def main():
             'species': 'Human/Rat/Mouse',
             'case_label': 'CIRI',
             'control_label': 'Control',
+            'n_case': int(meta_df['n_case'].sum()) if 'n_case' in meta_df.columns else 0,
+            'n_control': int(meta_df['n_control'].sum()) if 'n_control' in meta_df.columns else 0,
+            'mean_case': meta_df['mean_case'].mean() if 'mean_case' in meta_df.columns else 0,
+            'mean_control': meta_df['mean_control'].mean() if 'mean_control' in meta_df.columns else 0,
+            'std_case': np.sqrt((meta_df['std_case']**2).sum()) if 'std_case' in meta_df.columns else 0,
+            'std_control': np.sqrt((meta_df['std_control']**2).sum()) if 'std_control' in meta_df.columns else 0,
             'mean_diff': meta_df['mean_diff'].mean(),
             'pvalue': meta_p,
         }
@@ -1050,7 +1146,7 @@ def main():
     # ============================================================
     # 可视化
     # ============================================================
-    plot_ferro_aging_scores(all_scores, all_stats)
+    plot_ferro_aging_scores(all_scores, all_stats, all_groups)
     plot_forest_plot(meta_df)
     
     # ============================================================
@@ -1114,8 +1210,14 @@ def main():
         
         f.write("\n\n结论:\n")
         f.write("-" * 50 + "\n")
-        n_sig = (meta_df['pvalue'].dropna() < 0.05).sum() - (1 if 'META-ANALYSIS' in meta_df['dataset'].values and 
-                 meta_df[meta_df['dataset']=='META-ANALYSIS']['pvalue'].values[0] < 0.05 else 0)
+        # 统计显著的数据集数量 (排除META-ANALYSIS行)
+        sig_datasets = 0
+        for _, r in meta_df.iterrows():
+            if r['dataset'] == 'META-ANALYSIS':
+                continue
+            if r['pvalue'] < 0.05:
+                sig_datasets += 1
+        n_sig = sig_datasets
         f.write(f"在{len(all_stats)}个独立数据集中, {n_sig}个显示铁衰老通路在CIRI中显著激活\n")
         if 'META-ANALYSIS' in meta_df['dataset'].values:
             mp = meta_df[meta_df['dataset']=='META-ANALYSIS']['pvalue'].values[0]
