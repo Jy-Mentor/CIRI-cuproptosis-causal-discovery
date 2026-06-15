@@ -77,108 +77,63 @@ GPL1355_FILE = str(Path(DATA_DIRS['GSE61616']) / 'GPL1355-10794 (1).txt')
 # 来源: Cell Metabolism 2026, Liu et al. "Vitamin C inhibits ACSL4 
 #        to alleviate ferro-aging in primates"
 #
-# 基因集构建:
-#   FerrDb驱动基因 + 衰老上调基因 ∩ 铁代谢基因
-#   = 39个通用衰老重叠基因 + 56个铁衰老特异性基因 = 95基因
+# 基因集构建: 用户提供的96个铁衰老基因 + 补充文献关键基因
+# 分类: 脂质过氧化(10) | 铁代谢(6) | 氧化应激(3) | 炎症(21)
+#       | 信号转录(23) | 细胞周期(4) | 自噬(5) | 生长因子(7) | 代谢(17) | 补充(2)
 
 FERRO_AGING_GENES = [
-    # === ACSL4核心通路 (铁衰老执行者) ===
-    "ACSL4",    # 长链脂酰辅酶A合成酶4 — 核心执行者,催化PUFA掺入膜磷脂
-    "LPCAT3",   # 溶血磷脂酰胆碱酰基转移酶3 — PUFA掺入膜磷脂
-    "ALOX5",    # 花生四烯酸5-脂氧合酶
-    "ALOX12",   # 花生四烯酸12-脂氧合酶
-    "ALOX15",   # 花生四烯酸15-脂氧合酶
-    "PTGS2",    # COX2 — 脂质过氧化标志物
-    "GPX4",     # GSH过氧化物酶4 — 核心抑制因子
+    # === 脂质过氧化 & 铁死亡执行 (10) ===
+    "ALOX15", "LPCAT3", "PTGS2", "DPP4", "LOX",
+    "SAT1", "DUOX1", "NOX4", "MPO", "ABCC1",
 
-    # === 铁代谢 ===
-    "TFRC",     # 转铁蛋白受体 — 铁摄取
-    "STEAP3",   # 铁还原酶 — Fe³⁺→Fe²⁺
-    "FTH1",     # 铁蛋白重链 — 铁储存
-    "SLC40A1",  # Ferroportin — 铁外排
-    "HAMP",     # Hepcidin — 铁外排抑制
-    "HMOX1",    # 血红素加氧酶1 — 铁释放
-    "NCOA4",    # 核受体共激活因子4 — 铁蛋白自噬
-    "IREB2",    # 铁调节元件结合蛋白2
-    "CISD1",    # CDGSH铁硫结构域1 — 线粒体铁
-    "PCBP1",    # 聚rC结合蛋白1 — 铁伴侣
-    "PCBP2",    # 聚rC结合蛋白2
+    # === 铁代谢 & 铁稳态 (6) ===
+    "TFRC", "HMOX1", "CDO1", "COX7A1", "SLC1A5", "CP",
 
-    # === 脂质过氧化 & 氧化应激 ===
-    "NFE2L2",   # NRF2 — 抗氧化主调控因子
-    "KEAP1",    # KEAP1 — NRF2负调控
-    "HMOX1",    # (已有) 血红素加氧酶1  
-    "NQO1",     # NAD(P)H醌氧化还原酶1
-    "GCLC",     # 谷氨酸-半胱氨酸连接酶催化亚基
-    "GCLM",     # 谷氨酸-半胱氨酸连接酶修饰亚基
-    "SLC7A11",  # xCT — 胱氨酸摄取
-    "TXNRD1",   # 硫氧还蛋白还原酶1
-    "PRDX1",    # 过氧化物还蛋白1
-    "SOD1",     # SOD1
-    "SOD2",     # SOD2
-    "CAT",      # 过氧化氢酶
+    # === 氧化应激 & 抗氧化防御 (3) ===
+    "SOD1", "KEAP1", "HIF1A",
 
-    # === 铁死亡核心调控 ===
-    "AIFM2",    # FSP1 — 非GPX4铁死亡抑制
-    "GCH1",     # GTP环化水解酶1 — BH4合成
-    "DHFR",     # 二氢叶酸还原酶 — BH4再生
-    "FANCD2",   # Fanconi贫血D2
-    "TP53",     # p53
-    "BAP1",     # BRCA1相关蛋白1
-    "VDAC2",    # 电压依赖性阴离子通道2
-    "VDAC3",    # 电压依赖性阴离子通道3
-    "CS",       # 柠檬酸合酶
-    "RPL8",     # 核糖体蛋白L8
+    # === 炎症 & 免疫应答 (21) ===
+    "IL6", "IL1B", "HMGB1", "S100A8", "CXCL10",
+    "CD74", "CD82", "IFNG", "IRF1", "IRF7", "IRF9",
+    "NLRP3", "TLR4", "TNFAIP3", "TNFAIP1", "KDM6B",
+    "SLAMF8", "PADI4", "LGMN", "CTSB", "ICA1",
 
-    # === 炎症 & 衰老相关 ===
-    "IL6",      # IL-6
-    "TNF",      # TNF-α
-    "IL1B",     # IL-1β
-    "CCL2",     # MCP-1
-    "CDKN1A",   # p21 — 衰老标志
-    "CDKN2A",   # p16 — 衰老标志
-    "LMNA",     # Lamin A/C — 核纤层蛋白
-    "S100A8",   # S100A8 — 炎症标志
-    "S100A9",   # S100A9
-    "HMGB1",    # HMGB1 — 损伤相关分子模式
-    "TGFB1",    # TGF-β1
-    "ICAM1",    # ICAM-1
-    "VCAM1",    # VCAM-1
-    "SELE",     # E-选择素
+    # === 细胞信号 & 转录调控 (23) ===
+    "BAP1", "E2F1", "E2F3", "EGR1", "SP1",
+    "YAP1", "WWTR1", "ZEB1", "BCL6", "EBF3",
+    "FOSL1", "RUNX3", "TBX2", "HBP1", "SMARCB1",
+    "SETD7", "SMURF2", "MEN1", "BRD7", "NR1D1",
+    "NR2F2", "PDE4B", "PPP2R2B",
 
-    # === 铁死亡特异性 (FerrDb驱动基因) ===
-    "ATF4",     # 激活转录因子4
-    "CHAC1",    # ChaC谷胱甘肽特异性γ-谷氨酰环转移酶1
-    "SAT1",     # 精胺/精胺N1-乙酰转移酶1
-    "GLS2",     # 谷氨酰胺酶2
-    "CARS",     # 半胱氨酰tRNA合成酶
-    "DPP4",     # 二肽基肽酶4
-    "HSPB1",    # 热休克蛋白B1
-    "CAV1",     # Caveolin-1
-    
-    # === 补充铁衰老文献基因 ===
-    "ACO1",     # 顺乌头酸酶1 (IRP1)
-    "SLC11A2",  # DMT1 — 二价金属转运体
-    "CP",       # 铜蓝蛋白
-    "FTL",      # 铁蛋白轻链
-    "LYZ",      # 溶菌酶
-    "MMP9",     # 基质金属蛋白酶9
-    "MPO",      # 髓过氧化物酶
-    "NFKB1",    # NF-κB1
-    "HIF1A",    # HIF-1α
-    "PPARG",    # PPARγ
-    "ABCC1",    # MRP1 — GSH转运
-    "SLC3A2",   # CD98hc — xCT亚基
-    "ATG5",     # 自噬相关5
-    "ATG7",     # 自噬相关7
-    "BECN1",    # Beclin1
+    # === 细胞周期 & 衰老 (4) ===
+    "CDKN1A", "DYRK1A", "FBXO31", "RBM3",
+
+    # === 自噬 & 蛋白质稳态 (7) ===
+    "ATG3", "HERPUD1", "ERN1", "SNCA", "LACTB",
+
+    # === 生长因子 & 细胞外基质 (7) ===
+    "EDN1", "EMP1", "EPHA2", "EPHA4", "IGFBP7",
+    "LIFR", "WNT5A",
+
+    # === 代谢 & 其他 (17) ===
+    "ACVR1B", "CAVIN1", "DPEP1", "GMFB", "KLF6",
+    "LCN2", "MAP3K14", "MAPK1", "MAPK14", "MCU",
+    "NUAK2", "PRKD1", "PTBP1", "SOCS1", "SOCS2",
+    "SPATA2", "TXNIP",
+
+    # === 额外补充 (从原文献保留的关键基因) ===
+    "ATF3", "PRDX1", "TXNRD1",
 ]
 
-# 核心铁衰老标志基因 (论文中明确验证的)
+# 核对: 8个分类 + 1个补充 = 96+ 基因
+assert len(set(FERRO_AGING_GENES)) == len(FERRO_AGING_GENES), "存在重复基因！"
+print(f"[INFO] 铁衰老基因集: {len(set(FERRO_AGING_GENES))} 个唯一基因")
+
+# 核心铁衰老标志基因 (基于新基因集的关键标志)
 CORE_FERRO_AGING_GENES = [
-    "ACSL4", "STEAP3", "FTH1", "PTGS2", "HMOX1",
-    "NFE2L2", "TFRC", "SLC40A1", "HAMP", "GPX4",
-    "SLC7A11", "NCOA4", "CDKN1A", "IL6"
+    "PTGS2", "HMOX1", "TFRC", "IL6", "IL1B",
+    "HMGB1", "S100A8", "KEAP1", "SOD1", "HIF1A",
+    "CDKN1A", "ALOX15", "NLRP3", "TLR4", "MPO"
 ]
 
 # 人-大鼠-小鼠基因同源映射 (手工整理已验证同源)
