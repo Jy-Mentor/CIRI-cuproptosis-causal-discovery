@@ -1015,34 +1015,42 @@ def i_squared_heterogeneity(comparisons: List[dict],
     return float(I2)
 
 
-def lodo_cross_validation(comparisons: List[dict], meta_func: callable) -> dict:
+def lodo_cross_validation(comparisons: List[dict], meta_func: callable) -> pd.DataFrame:
     """
     留一数据集交叉验证 (LODO): 检查 Meta 分析稳定性
 
     每剔除一个数据集, 重新计算 Meta p 值.
     meta_func 签名: (p_values, directions) → float
+
+    重要: p值与效应量联合过滤, 避免长度不对齐导致合并失真.
     """
     results = []
     for i, comp in enumerate(comparisons):
         subset = [c for j, c in enumerate(comparisons) if j != i]
 
-        # 铁死亡: p值 + 效应方向
-        p_ferr = [c.get('p_ferroptosis') for c in subset
-                  if pd.notna(c.get('p_ferroptosis'))]
-        d_ferr = [c.get('d_ferroptosis') for c in subset
-                  if pd.notna(c.get('d_ferroptosis'))]
-        dir_ferr = [int(np.sign(d)) if pd.notna(d) and d != 0 else 1
-                    for d in d_ferr]
-        meta_ferr = meta_func(p_ferr, dir_ferr) if len(p_ferr) >= 2 else np.nan
+        # 铁死亡: 联合过滤 p值 + 效应量 (避免独立过滤导致长度不匹配)
+        valid_ferr = [(c['p_ferroptosis'], c['d_ferroptosis']) for c in subset
+                      if pd.notna(c.get('p_ferroptosis'))
+                      and pd.notna(c.get('d_ferroptosis'))]
+        if len(valid_ferr) >= 2:
+            p_ferr, d_ferr = zip(*valid_ferr)
+            dir_ferr = [int(np.sign(d)) if d != 0 else 1 for d in d_ferr]
+            meta_ferr = meta_func(list(p_ferr), dir_ferr)
+        else:
+            p_ferr, d_ferr = [], []
+            meta_ferr = np.nan
 
-        # 衰老: p值 + 效应方向
-        p_sene = [c.get('p_senescence') for c in subset
-                  if pd.notna(c.get('p_senescence'))]
-        d_sene = [c.get('d_senescence') for c in subset
-                  if pd.notna(c.get('d_senescence'))]
-        dir_sene = [int(np.sign(d)) if pd.notna(d) and d != 0 else 1
-                    for d in d_sene]
-        meta_sene = meta_func(p_sene, dir_sene) if len(p_sene) >= 2 else np.nan
+        # 衰老: 联合过滤 p值 + 效应量
+        valid_sene = [(c['p_senescence'], c['d_senescence']) for c in subset
+                      if pd.notna(c.get('p_senescence'))
+                      and pd.notna(c.get('d_senescence'))]
+        if len(valid_sene) >= 2:
+            p_sene, d_sene = zip(*valid_sene)
+            dir_sene = [int(np.sign(d)) if d != 0 else 1 for d in d_sene]
+            meta_sene = meta_func(list(p_sene), dir_sene)
+        else:
+            p_sene, d_sene = [], []
+            meta_sene = np.nan
 
         results.append({
             'removed_dataset': comp['dataset'],
@@ -1488,6 +1496,8 @@ def main():
                         and pd.notna(p.get('p_perm')) and p['p_perm'] < 0.05)
     logger.info(f"  置换检验: 铁死亡 {perm_sig_ferr}/{len([p for p in perm_results if p['gene_set']=='Ferroptosis'])} 显著, "
                 f"衰老 {perm_sig_sene}/{len([p for p in perm_results if p['gene_set']=='Senescence'])} 显著")
+    perm_df = pd.DataFrame(perm_results)
+    perm_df.to_csv(OUTPUT_DIR / 'L1_permutation_tests.csv', index=False)
 
     # 4c. ROC/AUC (基于all_meta)
     roc_results = []
