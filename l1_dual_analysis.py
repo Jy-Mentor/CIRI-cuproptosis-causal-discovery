@@ -1,0 +1,1019 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+=====================================================================
+L1: 双评分分析 — 在CIRI中识别铁驱动的衰老程序 (IDSP)
+=====================================================================
+核心逻辑:
+  Step 1: 对每个样本/细胞同时计算铁死亡评分和衰老评分
+  Step 2: 计算 IDSP Index = z(ferr) + z(sene) - |z(ferr) - z(sene)|
+  Step 3: 时间动态分析 (GSE104036) 验证铁死亡(早峰) vs 衰老(持续)
+  Step 4: GPX4验证 — 排除典型铁死亡
+  Step 5: 跨数据集Meta分析 — 验证IDSP的跨物种保守性
+
+输出:
+  - l1_results/ 目录下所有图表和数据
+  - L1_dual_scores_all_datasets.csv    — 每个样本的双评分
+  - L1_dual_comparison_summary.csv     — 各数据集区分度统计
+  - L1_temporal_dual_scores.csv        — GSE104036时间动态
+  - L1_gpx4_validation.csv             — GPX4验证
+  - L1_idsp_index_all.csv              — IDSP Index
+  
+数据依赖 (D:盘):
+  D:\反向网络药理...
+  D盘已确认可读
+
+用法: python l1_dual_analysis.py
+=====================================================================
+"""
+
+import os, sys, re, gzip, json, warnings, logging
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Set
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import numpy as np
+import pandas as pd
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+
+# ============================================================
+# 导入三基因集
+# ============================================================
+sys.path.insert(0, str(Path(__file__).parent))
+from idsp_gene_sets import (
+    PURE_FERROPTOSIS, PURE_SENESCENCE, SHARED_GENES,
+    FERROPTOSIS_ALL, SENESCENCE_ALL
+)
+
+warnings.filterwarnings('ignore')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# 路径配置
+# ============================================================
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "l1_results"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+FIGS_DIR = OUTPUT_DIR / "figures"
+FIGS_DIR.mkdir(exist_ok=True)
+
+DATA_DIRS = {
+    'GSE16561':  r'D:\反向网络药理学\L1 数据集\bulk\GSE16561',
+    'GSE37587':  r'D:\反向网络药理学\L1 数据集\bulk\GSE37587',
+    'GSE61616':  r'D:\反向网络药理学\L1 数据集\bulk\GSE61616（7d）',
+    'GSE97537':  r'D:\反向网络药理学\L1 数据集\bulk\GSE97537(24H)',
+    'GSE104036': r'D:\反向网络药理学\L1 数据集\bulk\GSE104036（多时序）',
+}
+GPL6883_ANNOT = str(BASE_DIR / 'GPL6883.annot.gz')
+GPL1355_FILE = str(Path(DATA_DIRS['GSE61616']) / 'GPL1355-10794 (1).txt')
+
+# ============================================================
+# GENE SET REPORT
+# ============================================================
+logger.info("=" * 60)
+logger.info(f"纯铁死亡基因集:    {len(PURE_FERROPTOSIS)} 基因")
+logger.info(f"纯衰老基因集:      {len(PURE_SENESCENCE)} 基因")
+logger.info(f"共享基因集:        {len(SHARED_GENES)} 基因")
+logger.info(f"铁死亡∩衰老交集:   {len(PURE_FERROPTOSIS & PURE_SENESCENCE)} (应为0)")
+assert PURE_FERROPTOSIS.isdisjoint(PURE_SENESCENCE), "PURE集不能重叠!"
+logger.info("=" * 60)
+
+# ============================================================
+# 数据加载函数 (从ferro_aging_ciri_analysis.py复用)
+# ============================================================
+
+def find_file(dir_path: str, keywords: List[str]) -> Optional[str]:
+    if not os.path.isdir(dir_path):
+        return None
+    for root, dirs, files in os.walk(dir_path):
+        for f in files:
+            if all(k.lower() in f.lower() for k in keywords):
+                return os.path.join(root, f)
+    return None
+
+def parse_series_matrix(filepath: str) -> pd.DataFrame:
+    """解析GEO Series Matrix文件"""
+    open_func = gzip.open if str(filepath).endswith('.gz') else open
+    with open_func(filepath, 'rt', encoding='latin-1') as f:
+        content = f.read()
+    lines = content.splitlines()
+    header_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith('!series_matrix_table_begin'):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            header_idx = j
+            break
+    if header_idx is None:
+        raise ValueError(f"无法找到series_matrix_table_begin: {filepath}")
+    header = lines[header_idx].strip().split('\t')
+    header = [h.strip('"').strip() for h in header]
+    data_lines = []
+    for i in range(header_idx + 1, len(lines)):
+        if lines[i].startswith('!series_matrix_table_end'):
+            break
+        stripped = lines[i].strip()
+        if stripped:
+            data_lines.append(lines[i])
+    data = []
+    index = []
+    for line in data_lines:
+        fields = line.strip().split('\t')
+        if len(fields) < 2:
+            continue
+        probe_id = fields[0].strip('"').strip()
+        index.append(probe_id)
+        values = [float(v) if v != 'null' and v != '' else np.nan
+                  for v in fields[1:]]
+        if len(values) < len(header) - 1:
+            values.extend([np.nan] * (len(header) - 1 - len(values)))
+        data.append(values[:len(header) - 1])
+    df = pd.DataFrame(data, index=index, columns=header[1:])
+    logger.info(f"  解析 {os.path.basename(filepath)}: {df.shape}")
+    return df
+
+def parse_gpl1355_annotation(filepath: str) -> Dict[str, str]:
+    probe_map = {}
+    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+        in_table = False
+        for line in f:
+            l = line.strip()
+            if l.startswith('ID'):
+                in_table = True
+                header = l.split('\t')
+                try:
+                    gene_col = next(i for i, h in enumerate(header)
+                                    if 'gene symbol' in h.lower() or 'symbol' in h.lower())
+                except StopIteration:
+                    gene_col = 5
+                continue
+            if not in_table or not l:
+                continue
+            fields = l.split('\t')
+            if len(fields) <= max(gene_col, 0):
+                continue
+            probe = fields[0]
+            gene = fields[gene_col].strip('"').strip()
+            if gene and gene != '':
+                probe_map[probe] = gene.split('///')[0].strip()
+    logger.info(f"  GPL1355: {len(probe_map)} 探针注释")
+    return probe_map
+
+def collapse_probes(expr_df: pd.DataFrame, probe_map: Dict[str, str]) -> pd.DataFrame:
+    """探针→基因折叠 (最大表达值, 大写)"""
+    mapped = expr_df[expr_df.index.isin(probe_map.keys())].copy()
+    if mapped.empty:
+        return expr_df
+    gene_series = pd.Series(mapped.index.map(probe_map), index=mapped.index)
+    gene_series = gene_series.dropna()
+    mapped = mapped.loc[gene_series.index]
+    gene_series = gene_series.str.upper()
+    mapped.index = gene_series
+    mapped = mapped.groupby(mapped.index).max()
+    return mapped
+
+# ============================================================
+# 核心函数: 单样本秩和富集评分
+# ============================================================
+
+def rank_sum_enrichment_score(expr: np.ndarray, gene_mask: np.ndarray) -> float:
+    """秩和富集评分 (单样本)"""
+    n_genes = len(expr)
+    n_set = gene_mask.sum()
+    if n_set == 0 or n_set == n_genes:
+        return 0.0
+    ranks = stats.rankdata(expr, method='average')
+    set_ranks = ranks[gene_mask]
+    expected = n_set * (n_genes + 1) / 2
+    sum_ranks = set_ranks.sum()
+    max_dev = n_set * (n_genes - n_set)
+    if max_dev == 0:
+        return 0.0
+    return float((sum_ranks - expected) / (max_dev / 2))
+
+def compute_enrichment_score_matrix(expr_df: pd.DataFrame, gene_set: Set[str]) -> pd.Series:
+    """对表达矩阵所有样本计算秩和富集评分"""
+    common_genes = [g for g in gene_set if g in expr_df.index]
+    if len(common_genes) < 5:
+        logger.warning(f"  基因集交集过小: {len(common_genes)}")
+        return pd.Series(index=expr_df.columns, dtype=float)
+    gene_mask = expr_df.index.isin(common_genes)
+    scores = {}
+    for col in expr_df.columns:
+        vals = expr_df[col].values.astype(float)
+        valid = ~np.isnan(vals)
+        if valid.sum() < 50:
+            scores[col] = np.nan
+            continue
+        scores[col] = rank_sum_enrichment_score(vals[valid], gene_mask[valid])
+    result = pd.Series(scores)
+    logger.info(f"  富集评分: {len(common_genes)}/{len(gene_set)} 匹配, {result.notna().sum()} 样本有效")
+    return result
+
+# ============================================================
+# 新增: 双评分 + IDSP Index + GPX4验证
+# ============================================================
+
+def dual_enrichment_analysis(expr_df: pd.DataFrame, dataset_name: str,
+                              case_cols: List[str], control_cols: List[str]) -> Tuple[pd.DataFrame, dict]:
+    """
+    双评分分析: 同时计算铁死亡和衰老的富集得分
+
+    Returns:
+        scores_df: 每个样本的三维评分
+        comparison: 区分度统计字典
+    """
+    # 计算三个评分
+    ferr_score = compute_enrichment_score_matrix(expr_df, PURE_FERROPTOSIS)
+    sene_score = compute_enrichment_score_matrix(expr_df, PURE_SENESCENCE)
+    share_score = compute_enrichment_score_matrix(expr_df, SHARED_GENES)
+
+    # 合并
+    scores_df = pd.DataFrame({
+        'ferroptosis': ferr_score,
+        'senescence': sene_score,
+        'shared': share_score,
+    })
+    scores_df['dataset'] = dataset_name
+    scores_df['sample'] = scores_df.index
+    scores_df['group'] = 'control'
+    scores_df.loc[scores_df.index.isin(case_cols), 'group'] = 'case'
+
+    # 计算 IDSP Index
+    scores_df['idsp_index'] = calc_idsp_index(scores_df['ferroptosis'], scores_df['senescence'])
+
+    # 统计
+    case = scores_df[scores_df['group'] == 'case'].dropna(subset=['ferroptosis', 'senescence'])
+    ctrl = scores_df[scores_df['group'] == 'control'].dropna(subset=['ferroptosis', 'senescence'])
+
+    # 双评分相关性 (所有样本)
+    valid_all = scores_df.dropna(subset=['ferroptosis', 'senescence'])
+    if len(valid_all) >= 3:
+        r_all, p_all = stats.pearsonr(valid_all['ferroptosis'], valid_all['senescence'])
+    else:
+        r_all, p_all = np.nan, np.nan
+
+    # 效应量
+    d_ferr = cohens_d(case['ferroptosis'].values, ctrl['ferroptosis'].values) if len(case)>=2 and len(ctrl)>=2 else np.nan
+    d_sene = cohens_d(case['senescence'].values, ctrl['senescence'].values) if len(case)>=2 and len(ctrl)>=2 else np.nan
+    d_idsp = cohens_d(case['idsp_index'].values, ctrl['idsp_index'].values) if len(case)>=2 and len(ctrl)>=2 else np.nan
+
+    # t检验
+    _, p_ferr = stats.ttest_ind(case['ferroptosis'], ctrl['ferroptosis'], equal_var=False) if len(case)>=2 and len(ctrl)>=2 else (None, np.nan)
+    _, p_sene = stats.ttest_ind(case['senescence'], ctrl['senescence'], equal_var=False) if len(case)>=2 and len(ctrl)>=2 else (None, np.nan)
+    _, p_idsp = stats.ttest_ind(case['idsp_index'], ctrl['idsp_index'], equal_var=False) if len(case)>=2 and len(ctrl)>=2 else (None, np.nan)
+
+    comparison = {
+        'dataset': dataset_name,
+        'n_case': len(case), 'n_control': len(ctrl),
+        'ferr_case_mean': case['ferroptosis'].mean(), 'ferr_ctrl_mean': ctrl['ferroptosis'].mean(),
+        'sene_case_mean': case['senescence'].mean(), 'sene_ctrl_mean': ctrl['senescence'].mean(),
+        'r_ferr_sene': r_all, 'p_corr': p_all,
+        'd_ferroptosis': d_ferr, 'd_senescence': d_sene, 'd_idsp': d_idsp,
+        'p_ferroptosis': p_ferr, 'p_senescence': p_sene, 'p_idsp': p_idsp,
+    }
+
+    logger.info(f"  [{dataset_name}] r={r_all:.3f}, d_ferr={d_ferr:.3f}, d_sene={d_sene:.3f}, "
+                f"p_ferr={p_ferr:.4e}, p_sene={p_sene:.4e}")
+
+    return scores_df, comparison
+
+
+def calc_idsp_index(ferr_score: pd.Series, sene_score: pd.Series) -> pd.Series:
+    """
+    IDSP Index = z(ferr) + z(sene) - |z(ferr) - z(sene)|
+
+    含义: 两个得分都高且差异小时 → IDSP Index 最大
+    """
+    z_ferr = (ferr_score - ferr_score.mean()) / ferr_score.std()
+    z_sene = (sene_score - sene_score.mean()) / sene_score.std()
+    return z_ferr + z_sene - np.abs(z_ferr - z_sene)
+
+
+def gpx4_validation(expr_df: pd.DataFrame, scores_df: pd.DataFrame,
+                     case_cols: List[str], control_cols: List[str],
+                     dataset_name: str) -> dict:
+    """
+    GPX4分层验证: 高IDSP样本中GPX4是否下降？
+
+    铁死亡: GPX4 ↓↓↓
+    IDSP:   GPX4 不变或轻微变化
+
+    如果GPX4在高IDSP组不显著低于对照组 → 支持IDSP假说
+    """
+    if 'GPX4' not in expr_df.index:
+        return {'dataset': dataset_name, 'gpx4_found': False}
+
+    scores = scores_df.copy()
+    scores['gpx4_expr'] = np.nan
+    for col in scores.index:
+        if col in expr_df.columns:
+            scores.loc[col, 'gpx4_expr'] = expr_df.loc['GPX4', col]
+
+    scores = scores.dropna(subset=['gpx4_expr', 'idsp_index'])
+    if len(scores) < 6:
+        return {'dataset': dataset_name, 'gpx4_found': True, 'n_too_small': True}
+
+    # 按IDSP Index分高/低组
+    median_idsp = scores['idsp_index'].median()
+    high_idsp = scores[scores['idsp_index'] >= median_idsp]['gpx4_expr'].values
+    low_idsp = scores[scores['idsp_index'] < median_idsp]['gpx4_expr'].values
+
+    # t检验: 高IDSP vs 低IDSP 的GPX4
+    _, pval = stats.ttest_ind(high_idsp, low_idsp, equal_var=False)
+    mean_high, mean_low = high_idsp.mean(), low_idsp.mean()
+    log2fc = mean_high - mean_low
+
+    # 判断: log2fc > -0.5 且 p > 0.05 → GPX4没有显著下降
+    verdict = "IDSP_supported" if (log2fc > -0.5 or pval > 0.05) else "IDSP_not_supported"
+
+    logger.info(f"  [{dataset_name}] GPX4: highIDSP={mean_high:.3f}, lowIDSP={mean_low:.3f}, "
+                f"Δ={log2fc:.3f}, p={pval:.4f} → {verdict}")
+
+    return {
+        'dataset': dataset_name,
+        'gpx4_found': True,
+        'n_high_idsp': len(high_idsp), 'n_low_idsp': len(low_idsp),
+        'gpx4_mean_high': mean_high, 'gpx4_mean_low': mean_low,
+        'gpx4_log2fc': log2fc,
+        'pvalue': pval,
+        'verdict': verdict,
+    }
+
+
+def cohens_d(case: np.ndarray, control: np.ndarray) -> float:
+    """Cohen's d 效应量"""
+    n1, n2 = len(case), len(control)
+    s1, s2 = np.var(case, ddof=1), np.var(control, ddof=1)
+    pooled = np.sqrt(((n1 - 1) * s1 + (n2 - 1) * s2) / (n1 + n2 - 2))
+    return (np.mean(case) - np.mean(control)) / pooled if pooled > 0 else 0.0
+
+
+def analyze_signature_genes(expr_df: pd.DataFrame, case_cols: List[str],
+                             control_cols: List[str], gene_set: Set[str],
+                             dataset_name: str) -> pd.DataFrame:
+    """单基因差异分析 (ACSLA4, PTGS2等)"""
+    case_cols = [c for c in case_cols if c in expr_df.columns]
+    control_cols = [c for c in control_cols if c in expr_df.columns]
+    if not case_cols or not control_cols:
+        return pd.DataFrame()
+    common = [g for g in expr_df.index if g in gene_set]
+    results = []
+    for gene in common:
+        raw_case = expr_df.loc[gene, case_cols].values.astype(float)
+        raw_ctrl = expr_df.loc[gene, control_cols].values.astype(float)
+        case_vals = raw_case[~np.isnan(raw_case)]
+        ctrl_vals = raw_ctrl[~np.isnan(raw_ctrl)]
+        if len(case_vals) < 2 or len(ctrl_vals) < 2:
+            continue
+        log2fc = np.mean(case_vals) - np.mean(ctrl_vals)
+        _, pval = stats.ttest_ind(case_vals, ctrl_vals, equal_var=False)
+        results.append({
+            'dataset': dataset_name,
+            'gene': gene,
+            'mean_case': np.mean(case_vals),
+            'mean_control': np.mean(ctrl_vals),
+            'log2FC': log2fc,
+            'pvalue': pval,
+        })
+    df = pd.DataFrame(results)
+    if not df.empty:
+        _, padj, _, _ = multipletests(df['pvalue'], method='fdr_bh')
+        df['padj'] = padj
+        df = df.sort_values('pvalue')
+    return df
+
+
+def fisher_meta_analysis(p_values: List[float]) -> Tuple[float, float]:
+    """Fisher 合并p值"""
+    valid_p = [p for p in p_values if 0 < p <= 1]
+    if len(valid_p) < 2:
+        return np.nan, np.nan
+    chi2 = -2 * np.sum(np.log(valid_p))
+    df = 2 * len(valid_p)
+    meta_p = 1 - stats.chi2.cdf(chi2, df)
+    return chi2, meta_p
+
+# ============================================================
+# 数据集处理 (复用加载逻辑 + 改用双评分)
+# ============================================================
+
+def _load_expr_gse16561() -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """加载GSE16561数据, 返回(expr_gene, case_cols, control_cols)"""
+    logger.info("=" * 50)
+    logger.info("[GSE16561] 人全血: Stroke vs Control")
+    sm_file = find_file(DATA_DIRS['GSE16561'], ['series_matrix'])
+    if not sm_file:
+        raise FileNotFoundError("GSE16561 未找到")
+    expr_df = parse_series_matrix(sm_file)
+    with gzip.open(sm_file, 'rt', encoding='latin-1') as f:
+        lines = f.readlines()
+    desc_line = sample_line = None
+    for l in lines:
+        if l.startswith('!Sample_description'):
+            desc_line = l.strip().split('\t')
+        if l.startswith('!Sample_geo_accession'):
+            sample_line = l.strip().split('\t')
+    case_cols, control_cols = [], []
+    for i, gsm in enumerate(sample_line[1:], 1):
+        gsm = gsm.strip('"').strip()
+        desc = desc_line[i].strip('"').strip() if i < len(desc_line) else ''
+        if 'Stroke' in desc or 'stroke' in desc:
+            case_cols.append(gsm)
+        else:
+            control_cols.append(gsm)
+    case_cols = [c for c in case_cols if c in expr_df.columns]
+    control_cols = [c for c in control_cols if c in expr_df.columns]
+    logger.info(f"  Stroke={len(case_cols)}, Control={len(control_cols)}")
+    probe_map = {}
+    if os.path.exists(GPL6883_ANNOT):
+        with gzip.open(GPL6883_ANNOT, 'rt', encoding='latin-1') as f:
+            in_table = False
+            for line in f:
+                l = line.strip()
+                if l == '!platform_table_begin':
+                    in_table = True
+                    header = f.readline().strip().split('\t')
+                    gs_idx = next((i for i, h in enumerate(header)
+                                    if 'gene symbol' in h.lower()), 2)
+                    continue
+                if not in_table or l == '':
+                    continue
+                fields = l.split('\t')
+                if len(fields) > gs_idx:
+                    probe = fields[0].strip('"').strip()
+                    gene = fields[gs_idx].strip('"').strip()
+                    if gene:
+                        probe_map[probe] = gene
+    expr_gene = collapse_probes(expr_df, probe_map)
+    return expr_gene, case_cols, control_cols
+
+
+def _load_expr_gse37587() -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """加载GSE37587 (人全血, 配对)"""
+    logger.info("=" * 50)
+    logger.info("[GSE37587] 人全血: Follow-Up vs Baseline (配对)")
+    sm_file = find_file(DATA_DIRS['GSE37587'], ['series_matrix'])
+    if not sm_file:
+        raise FileNotFoundError("GSE37587 未找到")
+    expr_df = parse_series_matrix(sm_file)
+    with gzip.open(sm_file, 'rt', encoding='latin-1') as f:
+        lines = f.readlines()
+    sample_line = desc_line = None
+    for l in lines:
+        if l.startswith('!Sample_geo_accession'):
+            sample_line = [x.strip('"').strip() for x in l.strip().split('\t')]
+        if l.startswith('!Sample_description'):
+            desc_line = [x.strip('"').strip() for x in l.strip().split('\t')]
+    case_cols, control_cols = [], []
+    for i, gsm in enumerate(sample_line[1:], 1):
+        desc = desc_line[i] if i < len(desc_line) else ''
+        desc_lower = desc.lower()
+        if any(kw in desc_lower for kw in ['follow-up', 'follow up', 'hour 24']):
+            case_cols.append(gsm)
+        elif any(kw in desc_lower for kw in ['baseline', 'hour 0', '0 hour']):
+            control_cols.append(gsm)
+    case_cols = [c for c in case_cols if c in expr_df.columns]
+    control_cols = [c for c in control_cols if c in expr_df.columns]
+    logger.info(f"  FU={len(case_cols)}, BL={len(control_cols)}")
+    probe_map = {}
+    if os.path.exists(GPL6883_ANNOT):
+        with gzip.open(GPL6883_ANNOT, 'rt', encoding='latin-1') as f:
+            in_table = False
+            for line in f:
+                l = line.strip()
+                if l == '!platform_table_begin':
+                    in_table = True
+                    header = f.readline().strip().split('\t')
+                    gs_idx = next((i for i, h in enumerate(header)
+                                    if 'gene symbol' in h.lower()), 2)
+                    continue
+                if not in_table or l == '':
+                    continue
+                fields = l.split('\t')
+                if len(fields) > gs_idx:
+                    probe = fields[0].strip('"').strip()
+                    gene = fields[gs_idx].strip('"').strip()
+                    if gene:
+                        probe_map[probe] = gene
+    expr_gene = collapse_probes(expr_df, probe_map)
+    return expr_gene, case_cols, control_cols
+
+
+def _load_expr_gse61616() -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """加载GSE61616 (大鼠MCAO 7d)"""
+    logger.info("=" * 50)
+    logger.info("[GSE61616] 大鼠 MCAO 7d")
+    sm_file = find_file(DATA_DIRS['GSE61616'], ['series_matrix'])
+    if not sm_file:
+        raise FileNotFoundError("GSE61616 未找到")
+    expr_df = parse_series_matrix(sm_file)
+    with gzip.open(sm_file, 'rt', encoding='latin-1') as f:
+        lines = f.readlines()
+    sample_acc = sample_title = None
+    for l in lines:
+        if l.startswith('!Sample_geo_accession'):
+            sample_acc = [x.strip('"').strip() for x in l.strip().split('\t')]
+        if l.startswith('!Sample_title'):
+            sample_title = [x.strip('"').strip() for x in l.strip().split('\t')]
+    sham_cols, model_cols = [], []
+    for i, gsm in enumerate(sample_acc[1:], 1):
+        title = sample_title[i].lower() if i < len(sample_title) else ''
+        if 'sham' in title:
+            sham_cols.append(gsm)
+        elif any(kw in title for kw in ['mcao', 'model', 'stroke']):
+            model_cols.append(gsm)
+    sham_cols = [c for c in sham_cols if c in expr_df.columns]
+    model_cols = [c for c in model_cols if c in expr_df.columns]
+    logger.info(f"  Model={len(model_cols)}, Sham={len(sham_cols)}")
+    probe_map = {}
+    if os.path.exists(GPL1355_FILE):
+        probe_map = parse_gpl1355_annotation(GPL1355_FILE)
+    expr_gene = collapse_probes(expr_df, probe_map)
+    return expr_gene, model_cols, sham_cols
+
+
+def _load_expr_gse97537() -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """加载GSE97537 (大鼠MCAO 24h)"""
+    logger.info("=" * 50)
+    logger.info("[GSE97537] 大鼠 MCAO 24h")
+    sm_file = find_file(DATA_DIRS['GSE97537'], ['series_matrix'])
+    if not sm_file:
+        raise FileNotFoundError("GSE97537 未找到")
+    expr_df = parse_series_matrix(sm_file)
+    with gzip.open(sm_file, 'rt', encoding='latin-1') as f:
+        lines = f.readlines()
+    sample_acc = sample_title = None
+    for l in lines:
+        if l.startswith('!Sample_geo_accession'):
+            sample_acc = [x.strip('"').strip() for x in l.strip().split('\t')]
+        if l.startswith('!Sample_title'):
+            sample_title = [x.strip('"').strip() for x in l.strip().split('\t')]
+    sham_cols, mcao_cols = [], []
+    for i, gsm in enumerate(sample_acc[1:], 1):
+        title = sample_title[i].lower() if i < len(sample_title) else ''
+        if 'sham' in title:
+            sham_cols.append(gsm)
+        elif any(kw in title for kw in ['mcao', 'model', 'stroke']):
+            mcao_cols.append(gsm)
+    sham_cols = [c for c in sham_cols if c in expr_df.columns]
+    mcao_cols = [c for c in mcao_cols if c in expr_df.columns]
+    logger.info(f"  MCAO={len(mcao_cols)}, Sham={len(sham_cols)}")
+    probe_map = {}
+    if os.path.exists(GPL1355_FILE):
+        probe_map = parse_gpl1355_annotation(GPL1355_FILE)
+    expr_gene = collapse_probes(expr_df, probe_map)
+    return expr_gene, mcao_cols, sham_cols
+
+
+def _load_expr_gse104036() -> Tuple[pd.DataFrame, dict, List[str]]:
+    """
+    加载GSE104036 (小鼠RNA-seq, 多时间点)
+    Returns: (expr_df, timepoint_dict, sham_cols)
+    timepoint_dict = {'3hr': [cols], '6hr': [...], ...}
+    """
+    logger.info("=" * 50)
+    logger.info("[GSE104036] 小鼠 RNA-seq: 多时间点")
+    counts_file = Path(DATA_DIRS['GSE104036']) / 'GSE104036_TC-RNAseq_counts.txt.gz'
+    if not counts_file.exists():
+        cf = find_file(DATA_DIRS['GSE104036'], ['counts', 'txt'])
+        counts_file = Path(cf) if cf else None
+    if counts_file and counts_file.exists():
+        logger.info(f"  加载: {counts_file.name}")
+        expr_df = pd.read_csv(str(counts_file), sep='\t', index_col=0, compression='gzip')
+    else:
+        sm_file = find_file(DATA_DIRS['GSE104036'], ['series_matrix'])
+        if not sm_file:
+            raise FileNotFoundError("GSE104036 数据未找到")
+        expr_df = parse_series_matrix(sm_file)
+    expr_df.columns = [c.strip('"').strip() for c in expr_df.columns]
+    expr_df.index = [str(idx).strip('"').strip() for idx in expr_df.index]
+    expr_df.index = expr_df.index.str.upper()
+    logger.info(f"  矩阵: {expr_df.shape}")
+
+    # 判断是否需要log转换
+    flat = expr_df.values.flatten()
+    flat = flat[~np.isnan(flat)]
+    if len(flat) > 0 and np.max(flat) > 50 and np.median(flat) > 5 and np.mean(flat == np.floor(flat)) > 0.5:
+        logger.info("  raw counts检测, 执行log2(CPM+1)")
+        col_sums = expr_df.sum()
+        cpm = expr_df.div(col_sums, axis=1) * 1e6
+        expr_df = np.log2(cpm + 1)
+
+    all_cols = expr_df.columns.tolist()
+    sham_cols = sorted([c for c in all_cols if re.match(r'^S\d+', str(c)) or 'sham' in str(c).lower()])
+    ipsi_candidates = [c for c in all_cols if 'sham' not in str(c).lower() and not re.match(r'^C\d+', str(c))]
+    ipsi_3hr = sorted([c for c in ipsi_candidates if re.search(r'(?i)3h', str(c))])
+    ipsi_6hr = sorted([c for c in ipsi_candidates if re.search(r'(?i)6h', str(c))])
+    ipsi_12hr = sorted([c for c in ipsi_candidates if re.search(r'(?i)12h', str(c))])
+    ipsi_24hr = sorted([c for c in ipsi_candidates if re.search(r'(?i)24h', str(c))])
+    timepoint_dict = {'3hr': ipsi_3hr, '6hr': ipsi_6hr, '12hr': ipsi_12hr, '24hr': ipsi_24hr}
+
+    logger.info(f"  Sham={len(sham_cols)}, 3hr={len(ipsi_3hr)}, 6hr={len(ipsi_6hr)}, "
+                f"12hr={len(ipsi_12hr)}, 24hr={len(ipsi_24hr)}")
+    return expr_df, timepoint_dict, sham_cols
+
+# ============================================================
+# 时间动态分析 (GSE104036)
+# ============================================================
+
+def temporal_dual_analysis(expr_df: pd.DataFrame, timepoint_dict: dict,
+                            sham_cols: List[str], dataset_name: str) -> pd.DataFrame:
+    """
+    时间动态双评分分析
+
+    预期:
+      铁死亡: 3h↑ → 6h达峰 → 12h↓ → 24h继续↓ (急性脉冲)
+      衰老:   3h不显著 → 6h开始 → 12h↑ → 24h持续 (慢性激活)
+    """
+    results = []
+    if not sham_cols:
+        logger.warning("  [GSE104036] 无Sham样本, 跳过时间动态分析")
+        return pd.DataFrame()
+
+    sham_ferr = compute_enrichment_score_matrix(expr_df[sham_cols], PURE_FERROPTOSIS)
+    sham_sene = compute_enrichment_score_matrix(expr_df[sham_cols], PURE_SENESCENCE)
+    sham_share = compute_enrichment_score_matrix(expr_df[sham_cols], SHARED_GENES)
+
+    for tp_name in ['3hr', '6hr', '12hr', '24hr']:
+        tp_cols = timepoint_dict.get(tp_name, [])
+        if len(tp_cols) < 2:
+            continue
+        ferr_tp = compute_enrichment_score_matrix(expr_df[tp_cols], PURE_FERROPTOSIS)
+        sene_tp = compute_enrichment_score_matrix(expr_df[tp_cols], PURE_SENESCENCE)
+        share_tp = compute_enrichment_score_matrix(expr_df[tp_cols], SHARED_GENES)
+
+        _, p_ferr = stats.ttest_ind(ferr_tp.dropna(), sham_ferr.dropna(), equal_var=False) if len(ferr_tp.dropna())>=2 and len(sham_ferr.dropna())>=2 else (None, np.nan)
+        _, p_sene = stats.ttest_ind(sene_tp.dropna(), sham_sene.dropna(), equal_var=False) if len(sene_tp.dropna())>=2 and len(sham_sene.dropna())>=2 else (None, np.nan)
+
+        results.append({
+            'dataset': dataset_name,
+            'timepoint': tp_name,
+            'time_hr': int(tp_name.replace('hr', '')),
+            'n_samples': len(tp_cols),
+            'ferroptosis_mean': ferr_tp.mean(),
+            'ferroptosis_sem': ferr_tp.std() / np.sqrt(len(ferr_tp.dropna())),
+            'senescence_mean': sene_tp.mean(),
+            'senescence_sem': sene_tp.std() / np.sqrt(len(sene_tp.dropna())),
+            'shared_mean': share_tp.mean(),
+            'p_ferroptosis': p_ferr,
+            'p_senescence': p_sene,
+        })
+        logger.info(f"    {tp_name}: ferr={ferr_tp.mean():.3f}(p={p_ferr:.4e}), "
+                    f"sene={sene_tp.mean():.3f}(p={p_sene:.4e})")
+
+    # 加入sham基线
+    results.append({
+        'dataset': dataset_name,
+        'timepoint': 'Sham',
+        'time_hr': 0,
+        'n_samples': len(sham_cols),
+        'ferroptosis_mean': sham_ferr.mean(),
+        'ferroptosis_sem': sham_ferr.std() / np.sqrt(len(sham_ferr.dropna())),
+        'senescence_mean': sham_sene.mean(),
+        'senescence_sem': sham_sene.std() / np.sqrt(len(sham_sene.dropna())),
+        'shared_mean': sham_share.mean(),
+        'p_ferroptosis': np.nan,
+        'p_senescence': np.nan,
+    })
+
+    return pd.DataFrame(results).sort_values('time_hr')
+
+# ============================================================
+# 可视化
+# ============================================================
+
+def plot_forest_dual(comparisons: List[dict], save_path: str):
+    """双评分效应量森林图"""
+    ds_names = [c['dataset'] for c in comparisons]
+    d_ferr = [c['d_ferroptosis'] for c in comparisons]
+    d_sene = [c['d_senescence'] for c in comparisons]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    y = np.arange(len(ds_names))
+    h = 0.3
+    ax.barh(y - h/2, d_ferr, h, label='Ferroptosis', color='#E74C3C', alpha=0.8)
+    ax.barh(y + h/2, d_sene, h, label='Senescence', color='#3498DB', alpha=0.8)
+    ax.set_yticks(y)
+    ax.set_yticklabels(ds_names)
+    ax.axvline(0, color='gray', ls='--', lw=0.8)
+    ax.set_xlabel("Cohen's d (Effect Size)")
+    ax.set_title('Dual Scoring: Ferroptosis vs Senescence in CIRI')
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  森林图保存: {save_path}")
+
+
+def plot_temporal_dual(temporal_df: pd.DataFrame, save_path: str):
+    """时间动态双曲线"""
+    if temporal_df.empty:
+        return
+    df = temporal_df.sort_values('time_hr')
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+
+    color_ferr = '#E74C3C'
+    color_sene = '#3498DB'
+    ax2 = ax1.twinx()
+
+    x = df['time_hr'].values
+    labels = df['timepoint'].values
+
+    ax1.errorbar(x, df['ferroptosis_mean'], yerr=df['ferroptosis_sem'],
+                 fmt='o-', color=color_ferr, capsize=4, label='Ferroptosis', markersize=8)
+    ax2.errorbar(x, df['senescence_mean'], yerr=df['senescence_sem'],
+                 fmt='s--', color=color_sene, capsize=4, label='Senescence', markersize=8)
+
+    ax1.set_xlabel('Time (hours post-MCAO)')
+    ax1.set_ylabel('Ferroptosis Score', color=color_ferr)
+    ax2.set_ylabel('Senescence Score', color=color_sene)
+    ax1.tick_params(axis='y', labelcolor=color_ferr)
+    ax2.tick_params(axis='y', labelcolor=color_sene)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels)
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+
+    plt.title('Temporal Dynamics: Ferroptosis vs Senescence in MCAO')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  时间动态图保存: {save_path}")
+
+
+def plot_scatter_dual(all_scores_df: pd.DataFrame, save_path: str):
+    """双评分散点图 (各数据集)"""
+    datasets = all_scores_df['dataset'].unique()
+    n = len(datasets)
+    fig, axes = plt.subplots(1, n, figsize=(5*n, 4), squeeze=False)
+    if n == 0:
+        return
+    for i, ds in enumerate(datasets):
+        ax = axes[0, i]
+        sub = all_scores_df[all_scores_df['dataset'] == ds].dropna(subset=['ferroptosis', 'senescence'])
+        colors = sub['group'].map({'case': '#E74C3C', 'control': '#3498DB'})
+        ax.scatter(sub['ferroptosis'], sub['senescence'], c=colors, alpha=0.7, s=40, edgecolors='none')
+        if len(sub) >= 3:
+            r, p = stats.pearsonr(sub['ferroptosis'], sub['senescence'])
+            ax.text(0.05, 0.95, f'r={r:.3f}\np={p:.3e}', transform=ax.transAxes,
+                    va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        ax.set_xlabel('Ferroptosis Score')
+        ax.set_ylabel('Senescence Score')
+        ax.set_title(ds)
+        ax.axhline(0, color='gray', ls='--', lw=0.5)
+        ax.axvline(0, color='gray', ls='--', lw=0.5)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  散点图保存: {save_path}")
+
+
+def plot_gene_heatmap(all_gene_dfs: List[pd.DataFrame], save_path: str):
+    """核心基因热图"""
+    if not all_gene_dfs:
+        return
+    combined = pd.concat(all_gene_dfs, ignore_index=True)
+    key_genes = ['ACSL4', 'PTGS2', 'HMOX1', 'TFRC', 'GPX4',
+                 'SLC7A11', 'CDKN1A', 'IL6', 'IL1B', 'HMGB1',
+                 'TP53', 'RB1', 'NFE2L2', 'KEAP1', 'HIF1A']
+    available = [g for g in key_genes if g in combined['gene'].values]
+    if len(available) < 3:
+        return
+    pivot = combined[combined['gene'].isin(available)].pivot_table(
+        index='gene', columns='dataset', values='log2FC', aggfunc='first')
+    pivot = pivot.loc[[g for g in available if g in pivot.index]]
+
+    fig, ax = plt.subplots(figsize=(len(pivot.columns)*1.5 + 2, len(pivot)*1.2 + 2))
+    im = ax.imshow(pivot.values, cmap='RdBu_r', aspect='auto', vmin=-2, vmax=2)
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns, rotation=45, ha='right')
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index)
+    for i in range(len(pivot.index)):
+        for j in range(len(pivot.columns)):
+            val = pivot.values[i, j]
+            if not np.isnan(val):
+                ax.text(j, i, f'{val:.1f}', ha='center', va='center',
+                        fontsize=7, color='white' if abs(val) > 1 else 'black')
+    plt.colorbar(im, ax=ax, label='log2FC', shrink=0.8)
+    ax.set_title('Core Gene Expression Changes (Case vs Control)')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  热图保存: {save_path}")
+
+# ============================================================
+# 主流程
+# ============================================================
+
+def main():
+    logger.info("=" * 60)
+    logger.info("L1: IDSP 双评分分析 — 在CIRI中识别铁驱动的衰老程序")
+    logger.info(f"纯铁死亡: {len(PURE_FERROPTOSIS)} | 纯衰老: {len(PURE_SENESCENCE)} | 共享: {len(SHARED_GENES)}")
+    logger.info("=" * 60)
+
+    # ============================================================
+    # 1. Bulk RNA-seq 双评分分析 (5个数据集)
+    # ============================================================
+    loaders = [
+        ('GSE16561', _load_expr_gse16561),
+        ('GSE37587', _load_expr_gse37587),
+        ('GSE61616', _load_expr_gse61616),
+        ('GSE97537', _load_expr_gse97537),
+    ]
+
+    all_scores = []
+    all_comparisons = []
+    all_gene_dfs = []
+    all_gpx4 = []
+    temporal_df = pd.DataFrame()
+
+    for ds_name, loader in loaders:
+        try:
+            expr_gene, case_cols, control_cols = loader()
+            scores_df, comp = dual_enrichment_analysis(expr_gene, ds_name, case_cols, control_cols)
+            all_scores.append(scores_df)
+            all_comparisons.append(comp)
+
+            # GPX4验证
+            gpx4_res = gpx4_validation(expr_gene, scores_df, case_cols, control_cols, ds_name)
+            all_gpx4.append(gpx4_res)
+
+            # 单基因分析
+            all_genes = PURE_FERROPTOSIS | PURE_SENESCENCE | SHARED_GENES
+            gene_df = analyze_signature_genes(expr_gene, case_cols, control_cols, all_genes, ds_name)
+            all_gene_dfs.append(gene_df)
+
+        except Exception as e:
+            logger.error(f"  ✗ {ds_name} 失败: {e}")
+            import traceback; traceback.print_exc()
+            continue
+
+    # ============================================================
+    # 2. GSE104036 时间动态分析
+    # ============================================================
+    try:
+        expr_104036, tp_dict, sham_cols = _load_expr_gse104036()
+        # 收集所有样本分组
+        all_ipsi = []
+        for tp_cols in tp_dict.values():
+            all_ipsi.extend(tp_cols)
+        scores_104036, comp_104036 = dual_enrichment_analysis(expr_104036, 'GSE104036', all_ipsi, sham_cols)
+        all_scores.append(scores_104036)
+        all_comparisons.append(comp_104036)
+
+        gpx4_104036 = gpx4_validation(expr_104036, scores_104036, all_ipsi, sham_cols, 'GSE104036')
+        all_gpx4.append(gpx4_104036)
+
+        all_genes = PURE_FERROPTOSIS | PURE_SENESCENCE | SHARED_GENES
+        gene_104036 = analyze_signature_genes(expr_104036, all_ipsi, sham_cols, all_genes, 'GSE104036')
+        all_gene_dfs.append(gene_104036)
+
+        # 时间动态
+        temporal_df = temporal_dual_analysis(expr_104036, tp_dict, sham_cols, 'GSE104036')
+
+    except Exception as e:
+        logger.error(f"  ✗ GSE104036 失败: {e}")
+        import traceback; traceback.print_exc()
+
+    # ============================================================
+    # 3. Meta分析
+    # ============================================================
+    logger.info("\n" + "=" * 50)
+    logger.info("Meta分析")
+
+    comp_df = pd.DataFrame(all_comparisons)
+
+    # 铁死亡 Meta分析
+    ferr_pvals = comp_df['p_ferroptosis'].dropna().values
+    if len(ferr_pvals) >= 2:
+        chi2_f, meta_p_f = fisher_meta_analysis(list(ferr_pvals))
+        logger.info(f"铁死亡 Meta: χ²={chi2_f:.2f}, p={meta_p_f:.4e}")
+    else:
+        meta_p_f = np.nan
+
+    # 衰老 Meta分析
+    sene_pvals = comp_df['p_senescence'].dropna().values
+    if len(sene_pvals) >= 2:
+        chi2_s, meta_p_s = fisher_meta_analysis(list(sene_pvals))
+        logger.info(f"衰老 Meta: χ²={chi2_s:.2f}, p={meta_p_s:.4e}")
+    else:
+        meta_p_s = np.nan
+
+    # ============================================================
+    # 4. 输出文件
+    # ============================================================
+    logger.info("\n" + "=" * 50)
+    logger.info("输出结果")
+
+    # 4a. 双评分数据
+    if all_scores:
+        all_scores_df = pd.concat(all_scores, ignore_index=False)
+        all_scores_df.to_csv(OUTPUT_DIR / 'L1_dual_scores_all_datasets.csv', index=True)
+        logger.info(f"  scores: {OUTPUT_DIR / 'L1_dual_scores_all_datasets.csv'}")
+
+    # 4b. 对比统计
+    comp_df.to_csv(OUTPUT_DIR / 'L1_dual_comparison_summary.csv', index=False)
+    logger.info(f"  comparison: {OUTPUT_DIR / 'L1_dual_comparison_summary.csv'}")
+
+    # 4c. 时间动态
+    if not temporal_df.empty:
+        temporal_df.to_csv(OUTPUT_DIR / 'L1_temporal_dual_scores.csv', index=False)
+        logger.info(f"  temporal: {OUTPUT_DIR / 'L1_temporal_dual_scores.csv'}")
+
+    # 4d. GPX4验证
+    gpx4_df = pd.DataFrame(all_gpx4)
+    gpx4_df.to_csv(OUTPUT_DIR / 'L1_gpx4_validation.csv', index=False)
+    logger.info(f"  gpx4: {OUTPUT_DIR / 'L1_gpx4_validation.csv'}")
+
+    # 4e. 单基因分析
+    if all_gene_dfs:
+        combined_genes = pd.concat(all_gene_dfs, ignore_index=True)
+        combined_genes.to_csv(OUTPUT_DIR / 'L1_gene_level_analysis.csv', index=False)
+        logger.info(f"  genes: {OUTPUT_DIR / 'L1_gene_level_analysis.csv'}")
+
+    # ============================================================
+    # 5. 可视化
+    # ============================================================
+    logger.info("\n" + "=" * 50)
+    logger.info("生成图表")
+
+    # Fig1A: 效应量森林图
+    plot_forest_dual(all_comparisons, str(FIGS_DIR / 'Fig1A_forest_dual.png'))
+
+    # Fig1B: 时间动态
+    if not temporal_df.empty:
+        plot_temporal_dual(temporal_df, str(FIGS_DIR / 'Fig1B_temporal_dual.png'))
+
+    # Fig1C: 散点图
+    if all_scores:
+        combined_scores = pd.concat(all_scores, ignore_index=False)
+        plot_scatter_dual(combined_scores, str(FIGS_DIR / 'Fig1C_scatter_dual.png'))
+
+    # Fig1D: 核心基因热图
+    plot_gene_heatmap(all_gene_dfs, str(FIGS_DIR / 'Fig1D_gene_heatmap.png'))
+
+    # ============================================================
+    # 6. 验证报告
+    # ============================================================
+    logger.info("\n" + "=" * 60)
+    logger.info("L1 验证报告")
+    logger.info("=" * 60)
+
+    # 判断标准1: 双评分相关性
+    r_values = comp_df['r_ferr_sene'].dropna()
+    mean_r = r_values.mean()
+    r_verdict = "PASS" if mean_r < 0.6 else ("WARNING" if mean_r < 0.8 else "FAIL")
+    logger.info(f"  双评分相关性: mean_r={mean_r:.3f} → {r_verdict}")
+
+    # 判断标准2: GPX4验证
+    gpx4_supported = sum(1 for g in all_gpx4 if g.get('verdict') == 'IDSP_supported')
+    gpx4_total = sum(1 for g in all_gpx4 if g.get('gpx4_found'))
+    gpx4_verdict = f"{gpx4_supported}/{gpx4_total} 数据集支持IDSP"
+    logger.info(f"  GPX4验证: {gpx4_verdict}")
+
+    # 判断标准3: 时间动态分离
+    if not temporal_df.empty:
+        tp = temporal_df.sort_values('time_hr')
+        ferr_peak_hr = tp.loc[tp['ferroptosis_mean'].idxmax(), 'time_hr'] if not tp.empty else -1
+        sene_peak_hr = tp.loc[tp['senescence_mean'].idxmax(), 'time_hr'] if not tp.empty else -1
+        temporal_verdict = "PASS" if sene_peak_hr > ferr_peak_hr else "WARNING"
+        logger.info(f"  时间动态: 铁死亡峰值={ferr_peak_hr}h, 衰老峰值={sene_peak_hr}h → {temporal_verdict}")
+    else:
+        logger.info("  时间动态: 无数据")
+
+    # 综合判断
+    logger.info(f"\n  L1 整体判定: {'✅ 可推进到L2' if r_verdict != 'FAIL' else '❌ 需要调整基因集'}")
+
+    # 保存报告
+    report_path = OUTPUT_DIR / 'L1_validation_report.txt'
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("L1: IDSP 双评分分析 — 验证报告\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"基因集: 纯铁死亡={len(PURE_FERROPTOSIS)}, 纯衰老={len(PURE_SENESCENCE)}, 共享={len(SHARED_GENES)}\n\n")
+        f.write("各数据集统计:\n")
+        for _, row in comp_df.iterrows():
+            f.write(f"  {row['dataset']}: r={row['r_ferr_sene']:.3f}, "
+                    f"d_ferr={row['d_ferroptosis']:.3f}, d_sene={row['d_senescence']:.3f}, "
+                    f"p_ferr={row['p_ferroptosis']:.3e}, p_sene={row['p_senescence']:.3e}\n")
+        f.write(f"\nMeta分析: 铁死亡 p={meta_p_f:.4e}, 衰老 p={meta_p_s:.4e}\n")
+        f.write(f"\nGPX4验证: {gpx4_verdict}\n")
+        f.write(f"时间动态: {temporal_verdict if not temporal_df.empty else 'N/A'}\n")
+
+    logger.info(f"\n  报告保存: {report_path}")
+    logger.info(f"\n{'='*60}")
+    logger.info("L1 分析完成!")
+    logger.info(f"结果目录: {OUTPUT_DIR}")
+    logger.info(f"{'='*60}")
+
+
+if __name__ == '__main__':
+    main()
