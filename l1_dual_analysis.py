@@ -46,7 +46,6 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # 导入三基因集（带 fallback 保护）
 # ============================================================
-sys.path.insert(0, str(Path(__file__).parent))
 try:
     from idsp_gene_sets import (
         PURE_FERROPTOSIS, PURE_SENESCENCE, SHARED_GENES,
@@ -219,7 +218,8 @@ def collapse_probes(expr_df: pd.DataFrame, probe_map: Dict[str, str]) -> pd.Data
     """探针→基因折叠 (最大表达值, 大写)"""
     mapped = expr_df[expr_df.index.isin(probe_map.keys())].copy()
     if mapped.empty:
-        return expr_df
+        logger.warning("  collapse_probes: 无探针成功映射到基因, 返回空矩阵")
+        return mapped
     gene_series = pd.Series(mapped.index.map(probe_map), index=mapped.index)
     gene_series = gene_series.dropna()
     mapped = mapped.loc[gene_series.index]
@@ -498,26 +498,7 @@ def _load_expr_gse16561() -> Tuple[pd.DataFrame, List[str], List[str]]:
     case_cols = [c for c in case_cols if c in expr_df.columns]
     control_cols = [c for c in control_cols if c in expr_df.columns]
     logger.info(f"  Stroke={len(case_cols)}, Control={len(control_cols)}")
-    probe_map = {}
-    if os.path.exists(GPL6883_ANNOT):
-        with gzip.open(GPL6883_ANNOT, 'rt', encoding='latin-1') as f:
-            in_table = False
-            for line in f:
-                l = line.strip()
-                if l == '!platform_table_begin':
-                    in_table = True
-                    header = f.readline().strip().split('\t')
-                    gs_idx = next((i for i, h in enumerate(header)
-                                    if 'gene symbol' in h.lower()), 2)
-                    continue
-                if not in_table or l == '':
-                    continue
-                fields = l.split('\t')
-                if len(fields) > gs_idx:
-                    probe = fields[0].strip('"').strip()
-                    gene = fields[gs_idx].strip('"').strip()
-                    if gene:
-                        probe_map[probe] = gene
+    probe_map = parse_gpl6883_annotation(GPL6883_ANNOT)
     expr_gene = collapse_probes(expr_df, probe_map)
     return expr_gene, case_cols, control_cols
 
@@ -549,26 +530,7 @@ def _load_expr_gse37587() -> Tuple[pd.DataFrame, List[str], List[str]]:
     case_cols = [c for c in case_cols if c in expr_df.columns]
     control_cols = [c for c in control_cols if c in expr_df.columns]
     logger.info(f"  FU={len(case_cols)}, BL={len(control_cols)}")
-    probe_map = {}
-    if os.path.exists(GPL6883_ANNOT):
-        with gzip.open(GPL6883_ANNOT, 'rt', encoding='latin-1') as f:
-            in_table = False
-            for line in f:
-                l = line.strip()
-                if l == '!platform_table_begin':
-                    in_table = True
-                    header = f.readline().strip().split('\t')
-                    gs_idx = next((i for i, h in enumerate(header)
-                                    if 'gene symbol' in h.lower()), 2)
-                    continue
-                if not in_table or l == '':
-                    continue
-                fields = l.split('\t')
-                if len(fields) > gs_idx:
-                    probe = fields[0].strip('"').strip()
-                    gene = fields[gs_idx].strip('"').strip()
-                    if gene:
-                        probe_map[probe] = gene
+    probe_map = parse_gpl6883_annotation(GPL6883_ANNOT)
     expr_gene = collapse_probes(expr_df, probe_map)
     return expr_gene, case_cols, control_cols
 
@@ -720,6 +682,13 @@ def temporal_dual_analysis(expr_df: pd.DataFrame, timepoint_dict: dict,
         sene_tp = compute_enrichment_score_matrix(expr_df[tp_cols], PURE_SENESCENCE)
         share_tp = compute_enrichment_score_matrix(expr_df[tp_cols], SHARED_GENES)
 
+        # Fix 4: 检查有效样本数
+        n_ferr_valid = ferr_tp.dropna().shape[0]
+        n_sene_valid = sene_tp.dropna().shape[0]
+        if n_ferr_valid < 2 or n_sene_valid < 2:
+            logger.warning(f"    {tp_name}: 有效样本不足 (ferr={n_ferr_valid}, sene={n_sene_valid}), 跳过")
+            continue
+
         _, p_ferr = stats.ttest_ind(ferr_tp.dropna(), sham_ferr.dropna(), equal_var=False) if len(ferr_tp.dropna())>=2 and len(sham_ferr.dropna())>=2 else (None, np.nan)
         _, p_sene = stats.ttest_ind(sene_tp.dropna(), sham_sene.dropna(), equal_var=False) if len(sene_tp.dropna())>=2 and len(sham_sene.dropna())>=2 else (None, np.nan)
 
@@ -790,7 +759,7 @@ def plot_forest_dual(comparisons: List[dict], save_path: str):
 
 
 def plot_temporal_dual(temporal_df: pd.DataFrame, save_path: str):
-    """时间动态双曲线"""
+    """时间动态双曲线 (Sham基线独立显示)"""
     if temporal_df.empty:
         return
     df = temporal_df.sort_values('time_hr')
@@ -800,27 +769,42 @@ def plot_temporal_dual(temporal_df: pd.DataFrame, save_path: str):
     color_sene = '#3498DB'
     ax2 = ax1.twinx()
 
-    x = df['time_hr'].values
-    labels = df['timepoint'].values
+    # 分离Sham与实际时间点
+    sham_row = df[df['timepoint'] == 'Sham']
+    tp_rows = df[df['timepoint'] != 'Sham']
 
-    ax1.errorbar(x, df['ferroptosis_mean'], yerr=df['ferroptosis_sem'],
-                 fmt='o-', color=color_ferr, capsize=4, label='Ferroptosis', markersize=8)
-    ax2.errorbar(x, df['senescence_mean'], yerr=df['senescence_sem'],
-                 fmt='s--', color=color_sene, capsize=4, label='Senescence', markersize=8)
+    if not sham_row.empty:
+        sham_ferr_mean = sham_row['ferroptosis_mean'].values[0]
+        sham_sene_mean = sham_row['senescence_mean'].values[0]
+        # 绘制Sham基线 (水平虚线)
+        ax1.axhline(sham_ferr_mean, color=color_ferr, ls=':', lw=1.5, alpha=0.5)
+        ax2.axhline(sham_sene_mean, color=color_sene, ls=':', lw=1.5, alpha=0.5)
+        # 标注Sham
+        ax1.text(0.02, sham_ferr_mean, 'Sham (Ferroptosis)', color=color_ferr,
+                 fontsize=8, alpha=0.7, va='center', transform=ax1.get_yaxis_transform())
+        ax2.text(0.02, sham_sene_mean, 'Sham (Senescence)', color=color_sene,
+                 fontsize=8, alpha=0.7, va='center', transform=ax2.get_yaxis_transform())
+        # 虚线分隔Sham与损伤时间点
+        ax1.axvline(x=0, color='gray', ls=':', lw=1, alpha=0.4)
 
-    # 用虚线分隔Sham基线
-    if -0.5 in x:
-        ax1.axvline(x=0, color='gray', ls=':', lw=1, alpha=0.6)
-        ax1.text(-0.5, ax1.get_ylim()[1]*0.95, 'Sham', ha='center', fontsize=9,
-                 style='italic', bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgray', alpha=0.5))
+    # 绘制实际时间点
+    if not tp_rows.empty:
+        x_tp = tp_rows['time_hr'].values
+        ax1.errorbar(x_tp, tp_rows['ferroptosis_mean'], yerr=tp_rows['ferroptosis_sem'],
+                     fmt='o-', color=color_ferr, capsize=4, label='Ferroptosis', markersize=8)
+        ax2.errorbar(x_tp, tp_rows['senescence_mean'], yerr=tp_rows['senescence_sem'],
+                     fmt='s--', color=color_sene, capsize=4, label='Senescence', markersize=8)
+        # x轴仅显示实际时间点
+        ax1.set_xticks(x_tp)
+        ax1.set_xticklabels([f'{int(h)}h' for h in x_tp])
+    else:
+        ax1.set_xticks([])
 
     ax1.set_xlabel('Time (hours post-MCAO)')
     ax1.set_ylabel('Ferroptosis Score', color=color_ferr)
     ax2.set_ylabel('Senescence Score', color=color_sene)
     ax1.tick_params(axis='y', labelcolor=color_ferr)
     ax2.tick_params(axis='y', labelcolor=color_sene)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(labels)
 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
@@ -1052,11 +1036,16 @@ def main():
     logger.info("L1 验证报告")
     logger.info("=" * 60)
 
-    # 判断标准1: 双评分相关性
+    # 判断标准1: 双评分相关性 (NaN安全)
     r_values = comp_df['r_ferr_sene'].dropna()
-    mean_r = r_values.mean()
-    r_verdict = "PASS" if mean_r < 0.6 else ("WARNING" if mean_r < 0.8 else "FAIL")
-    logger.info(f"  双评分相关性: mean_r={mean_r:.3f} → {r_verdict}")
+    if not r_values.empty:
+        mean_r = r_values.mean()
+        r_verdict = "PASS" if mean_r < 0.6 else ("WARNING" if mean_r < 0.8 else "FAIL")
+        logger.info(f"  双评分相关性: mean_r={mean_r:.3f} → {r_verdict}")
+    else:
+        mean_r = np.nan
+        r_verdict = "N/A"
+        logger.info("  双评分相关性: 无有效数据")
 
     # 判断标准2: GPX4验证
     gpx4_supported = sum(1 for g in all_gpx4 if g.get('verdict') == 'IDSP_supported')
@@ -1064,20 +1053,30 @@ def main():
     gpx4_verdict = f"{gpx4_supported}/{gpx4_total} 数据集支持IDSP"
     logger.info(f"  GPX4验证: {gpx4_verdict}")
 
-    # 判断标准3: 时间动态分离
+    # 安全格式化辅助
+    def safe_fmt(val, fmt='.3f'):
+        return ('{:' + fmt + '}').format(val) if pd.notna(val) else 'N/A'
+
+    # 判断标准3: 时间动态分离 (NaN安全)
     if not temporal_df.empty:
         tp = temporal_df.sort_values('time_hr')
-        ferr_peak_hr = tp.loc[tp['ferroptosis_mean'].idxmax(), 'time_hr'] if not tp.empty else -1
-        sene_peak_hr = tp.loc[tp['senescence_mean'].idxmax(), 'time_hr'] if not tp.empty else -1
-        temporal_verdict = "PASS" if sene_peak_hr > ferr_peak_hr else "WARNING"
-        logger.info(f"  时间动态: 铁死亡峰值={ferr_peak_hr}h, 衰老峰值={sene_peak_hr}h → {temporal_verdict}")
+        ferr_ser = tp['ferroptosis_mean'].dropna()
+        sene_ser = tp['senescence_mean'].dropna()
+        if not ferr_ser.empty and not sene_ser.empty:
+            ferr_peak_hr = tp.loc[ferr_ser.idxmax(), 'time_hr']
+            sene_peak_hr = tp.loc[sene_ser.idxmax(), 'time_hr']
+            temporal_verdict = "PASS" if sene_peak_hr > ferr_peak_hr else "WARNING"
+            logger.info(f"  时间动态: 铁死亡峰值={ferr_peak_hr}h, 衰老峰值={sene_peak_hr}h → {temporal_verdict}")
+        else:
+            temporal_verdict = "N/A (无数据)"
+            logger.info("  时间动态: 富集评分全为NaN, 无法判定")
     else:
         logger.info("  时间动态: 无数据")
 
     # 综合判断
     logger.info(f"\n  L1 整体判定: {'✅ 可推进到L2' if r_verdict != 'FAIL' else '❌ 需要调整基因集'}")
 
-    # 保存报告
+    # 保存报告 (NaN安全格式化)
     report_path = OUTPUT_DIR / 'L1_validation_report.txt'
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write("L1: IDSP 双评分分析 — 验证报告\n")
@@ -1085,12 +1084,12 @@ def main():
         f.write(f"基因集: 纯铁死亡={len(PURE_FERROPTOSIS)}, 纯衰老={len(PURE_SENESCENCE)}, 共享={len(SHARED_GENES)}\n\n")
         f.write("各数据集统计:\n")
         for _, row in comp_df.iterrows():
-            f.write(f"  {row['dataset']}: r={row['r_ferr_sene']:.3f}, "
-                    f"d_ferr={row['d_ferroptosis']:.3f}, d_sene={row['d_senescence']:.3f}, "
-                    f"p_ferr={row['p_ferroptosis']:.3e}, p_sene={row['p_senescence']:.3e}\n")
-        f.write(f"\nMeta分析: 铁死亡 p={meta_p_f:.4e}, 衰老 p={meta_p_s:.4e}\n")
+            f.write(f"  {row['dataset']}: r={safe_fmt(row['r_ferr_sene'])}, "
+                    f"d_ferr={safe_fmt(row['d_ferroptosis'])}, d_sene={safe_fmt(row['d_senescence'])}, "
+                    f"p_ferr={safe_fmt(row['p_ferroptosis'], '.3e')}, p_sene={safe_fmt(row['p_senescence'], '.3e')}\n")
+        f.write(f"\nMeta分析: 铁死亡 p={safe_fmt(meta_p_f, '.4e')}, 衰老 p={safe_fmt(meta_p_s, '.4e')}\n")
         f.write(f"\nGPX4验证: {gpx4_verdict}\n")
-        f.write(f"时间动态: {temporal_verdict if not temporal_df.empty else 'N/A'}\n")
+        f.write(f"时间动态: {temporal_verdict}\n")
 
     logger.info(f"\n  报告保存: {report_path}")
     logger.info(f"\n{'='*60}")
