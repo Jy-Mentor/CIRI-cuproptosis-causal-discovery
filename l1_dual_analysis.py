@@ -1102,7 +1102,8 @@ def robust_rank_aggregation(rank_matrix: pd.DataFrame) -> pd.DataFrame:
         if len(series) < 5:
             rank_matrix[col] = np.nan
             continue
-        rank_matrix[col] = stats.rankdata(series, method='average')
+        rank_matrix[col] = pd.Series(
+            stats.rankdata(series, method='average'), index=series.index)
 
     results = []
     for gene in rank_matrix.index:
