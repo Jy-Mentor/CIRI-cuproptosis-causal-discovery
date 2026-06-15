@@ -1601,6 +1601,32 @@ def main():
     else:
         re_sene = None
 
+    # 高级Meta结果汇总导出
+    meta_summary = {
+        'method': ['Fisher', 'Fisher', 'Stouffer_weighted', 'Stouffer_weighted',
+                   'Random_effects', 'Random_effects'],
+        'score': ['Ferroptosis', 'Senescence', 'Ferroptosis', 'Senescence',
+                  'Ferroptosis', 'Senescence'],
+        'p_value': [meta_p_f, meta_p_s, meta_p_stouffer_f, meta_p_stouffer_s,
+                    re_ferr['p_value'] if re_ferr else np.nan,
+                    re_sene['p_value'] if re_sene else np.nan],
+        'summary_d': [np.nan, np.nan, np.nan, np.nan,
+                      re_ferr['summary_effect'] if re_ferr else np.nan,
+                      re_sene['summary_effect'] if re_sene else np.nan],
+        'I2_pct': [np.nan, np.nan, np.nan, np.nan,
+                   re_ferr['I2'] if re_ferr else np.nan,
+                   re_sene['I2'] if re_sene else np.nan],
+        'tau2': [np.nan, np.nan, np.nan, np.nan,
+                 re_ferr['tau2'] if re_ferr else np.nan,
+                 re_sene['tau2'] if re_sene else np.nan],
+        'k': [len(ferr_pvals), len(sene_pvals),
+              len(ferr_p_for_p), len(sene_p_for_p),
+              re_ferr['k'] if re_ferr else 0,
+              re_sene['k'] if re_sene else 0],
+    }
+    pd.DataFrame(meta_summary).to_csv(OUTPUT_DIR / 'L1_meta_analysis_summary.csv', index=False)
+    logger.info("  Meta汇总保存: L1_meta_analysis_summary.csv")
+
     # 4g. 前沿: Robust Rank Aggregation (跨数据集基因一致性)
     logger.info("\n  前沿RRA分析:")
     rra_results = []
@@ -1755,7 +1781,12 @@ def main():
             f.write(f"  {row['dataset']}: r={safe_fmt(row['r_ferr_sene'])}, "
                     f"d_ferr={safe_fmt(row['d_ferroptosis'])}, d_sene={safe_fmt(row['d_senescence'])}, "
                     f"p_ferr={safe_fmt(row['p_ferroptosis'], '.3e')}, p_sene={safe_fmt(row['p_senescence'], '.3e')}\n")
-        f.write(f"\nMeta分析: 铁死亡 p={safe_fmt(meta_p_f, '.4e')}, 衰老 p={safe_fmt(meta_p_s, '.4e')}\n")
+        f.write(f"\nMeta分析 (Fisher): 铁死亡 p={safe_fmt(meta_p_f, '.4e')}, 衰老 p={safe_fmt(meta_p_s, '.4e')}\n")
+        f.write(f"Meta分析 (Stouffer加权): 铁死亡 p={safe_fmt(meta_p_stouffer_f, '.4e')}, 衰老 p={safe_fmt(meta_p_stouffer_s, '.4e')}\n")
+        if re_ferr:
+            f.write(f"随机效应Meta (铁死亡): d={safe_fmt(re_ferr['summary_effect'])}, p={safe_fmt(re_ferr['p_value'], '.4e')}, I²={safe_fmt(re_ferr['I2'], '.0f')}%, τ²={safe_fmt(re_ferr['tau2'], '.4f')}\n")
+        if re_sene:
+            f.write(f"随机效应Meta (衰老): d={safe_fmt(re_sene['summary_effect'])}, p={safe_fmt(re_sene['p_value'], '.4e')}, I²={safe_fmt(re_sene['I2'], '.0f')}%, τ²={safe_fmt(re_sene['tau2'], '.4f')}\n")
         f.write(f"\nGPX4验证: {gpx4_verdict}\n")
         f.write(f"时间动态: {temporal_verdict}\n")
 
