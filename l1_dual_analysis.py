@@ -363,14 +363,23 @@ def dual_enrichment_analysis(expr_df: pd.DataFrame, dataset_name: str,
     _, p_sene = stats.ttest_ind(case['senescence'], ctrl['senescence'], equal_var=False) if len(case)>=2 and len(ctrl)>=2 else (None, np.nan)
     _, p_idsp = stats.ttest_ind(case['idsp_index'], ctrl['idsp_index'], equal_var=False) if len(case)>=2 and len(ctrl)>=2 else (None, np.nan)
 
+    # 效应量方差 (用于 I² 和随机效应Meta)
+    n_c, n_ct = len(case), len(ctrl)
+    n_total = n_c + n_ct
+    var_ferr = ((n_c + n_ct) / (n_c * n_ct) + d_ferr**2 / (2 * n_total)
+                if pd.notna(d_ferr) and n_total >= 4 else np.nan)
+    var_sene = ((n_c + n_ct) / (n_c * n_ct) + d_sene**2 / (2 * n_total)
+                if pd.notna(d_sene) and n_total >= 4 else np.nan)
+
     comparison = {
         'dataset': dataset_name,
-        'n_case': len(case), 'n_control': len(ctrl),
+        'n_case': n_c, 'n_control': n_ct,
         'ferr_case_mean': case['ferroptosis'].mean(), 'ferr_ctrl_mean': ctrl['ferroptosis'].mean(),
         'sene_case_mean': case['senescence'].mean(), 'sene_ctrl_mean': ctrl['senescence'].mean(),
         'r_ferr_sene': r_all, 'p_corr': p_all,
         'd_ferroptosis': d_ferr, 'd_senescence': d_sene, 'd_idsp': d_idsp,
         'p_ferroptosis': p_ferr, 'p_senescence': p_sene, 'p_idsp': p_idsp,
+        'var_ferroptosis': var_ferr, 'var_senescence': var_sene,
     }
 
     logger.info(f"  [{dataset_name}] r={r_all:.3f}, d_ferr={d_ferr:.3f}, d_sene={d_sene:.3f}, "
@@ -509,21 +518,33 @@ def fisher_meta_analysis(p_values: List[float]) -> Tuple[float, float]:
     return chi2, meta_p
 
 
-def stouffer_meta(p_values: List[float], weights: Optional[List[float]] = None) -> float:
+def stouffer_meta(p_values: List[float], weights: Optional[List[float]] = None,
+                   directions: Optional[List[int]] = None) -> float:
     """
-    Stouffer's Z-score 合并p值 (可加权)
+    Stouffer's Z-score 合并p值 (可加权, 带效应方向)
 
-    比 Fisher 方法更灵活: 允许按样本量、效应量精度加权.
-    无权重时等价于等权重Stouffer.
+    需传入每项研究的效应方向 (±1), 避免 `np.sign(1-p/2)` 始终为正的假阳性问题.
+
+    Parameters
+    ----------
+    p_values   : 各研究的 p 值 (双侧)
+    weights    : 权重 (如样本量 sqrt), 默认等权
+    directions : 效应方向 (±1), 正效应=1, 负效应=-1, 默认全为正
+
     前沿参考: Zaykin (2011) Genet Epidemiol; 广泛应用于GWAS Meta分析.
     """
-    valid = [(p, w) for p, w in
-             zip(p_values, weights if weights else [1.0] * len(p_values))
+    if directions is None:
+        directions = [1] * len(p_values)
+    valid = [(p, w, d) for p, w, d in
+             zip(p_values,
+                 weights if weights else [1.0] * len(p_values),
+                 directions)
              if 0 < p <= 1]
     if len(valid) < 2:
         return np.nan
-    ps, ws = zip(*valid)
-    z_scores = [stats.norm.ppf(1 - p / 2) * np.sign(1 - p / 2) for p in ps]
+    ps, ws, ds = zip(*valid)
+    # 将双侧p值转换为单侧z值, 乘以效应方向
+    z_scores = [stats.norm.ppf(1 - p / 2) * np.sign(d) for p, d in zip(ps, ds)]
     w_sum = np.sqrt(np.sum(np.array(ws) ** 2))
     if w_sum == 0:
         return np.nan
@@ -891,52 +912,48 @@ def bootstrap_idsp_ci(scores_df: pd.DataFrame, n_bootstrap: int = 2000,
     }
 
 
-def permutation_enrichment_test(expr_df: pd.DataFrame, case_cols: List[str],
-                                 control_cols: List[str], gene_set: Set[str],
+def permutation_enrichment_test(scores: pd.Series, case_cols: List[str],
+                                 control_cols: List[str],
                                  n_perm: int = 2000, seed: int = 42) -> dict:
     """
-    置换检验: 基因集富集差异显著性 (替代参数ttest)
+    置换检验: 对样本标签置换, 检验两组评分差异的显著性 (替代参数ttest)
 
-    前沿参考: GSEApy (Zhuoqing Fang 2023) 使用 phenotype permutation.
-    此处实现更保守的随机标签置换, 控制家族wise错误率.
+    直接接受已计算好的单样本评分 Series, 对样本标签进行随机置换.
+    避免了 all-1s 伪矩阵产生的 NaN 问题.
+
+    前沿参考: GSEApy (Zhuoqing Fang 2023) phenotype permutation paradigm.
     """
-    common = [g for g in gene_set if g in expr_df.index]
-    if len(common) < 5:
-        return {'n_gene': len(common), 'obs_diff': np.nan, 'p_perm': np.nan,
-                'pval': np.nan, 'effect_size': np.nan}
+    case = scores[case_cols].dropna().values
+    ctrl = scores[control_cols].dropna().values
+    if len(case) < 3 or len(ctrl) < 3:
+        return {'obs_case_mean': np.nan, 'obs_ctrl_mean': np.nan,
+                'obs_diff': np.nan, 'p_perm': np.nan, 'effect_size': np.nan}
 
-    scores = compute_enrichment_score_matrix(expr_df, gene_set)
-    obs_case = scores[case_cols].dropna().mean()
-    obs_ctrl = scores[control_cols].dropna().mean()
-    obs_diff = obs_case - obs_ctrl
+    obs_case_mean = np.mean(case)
+    obs_ctrl_mean = np.mean(ctrl)
+    obs_diff = obs_case_mean - obs_ctrl_mean
 
-    all_valid = case_cols + control_cols
-    valid_scores = scores[all_valid].dropna()
-    if len(valid_scores) < 6 or obs_diff is np.nan:
-        return {'n_gene': len(common), 'obs_diff': obs_diff, 'p_perm': np.nan,
-                'pval': np.nan, 'effect_size': np.nan}
-
+    pooled = np.concatenate([case, ctrl])
+    n_case = len(case)
     rng = np.random.default_rng(seed)
-    n_case = len(case_cols)
+
     n_extreme = 0
     for _ in range(n_perm):
-        perm = rng.permutation(valid_scores.values)
-        perm_case, perm_ctrl = perm[:n_case], perm[n_case:]
-        perm_diff = perm_case.mean() - perm_ctrl.mean()
+        rng.shuffle(pooled)
+        perm_diff = np.mean(pooled[:n_case]) - np.mean(pooled[n_case:])
         if abs(perm_diff) >= abs(obs_diff):
             n_extreme += 1
 
     p_perm = (n_extreme + 1) / (n_perm + 1)
-    pooled = np.concatenate([valid_scores[case_cols].dropna().values,
-                             valid_scores[control_cols].dropna().values])
-    n_total = len(pooled)
-    d = (obs_case - obs_ctrl) / (np.std(pooled, ddof=1) + 1e-12)
+    d = obs_diff / (np.std(pooled, ddof=1) + 1e-12)
 
     return {
-        'n_gene': len(common), 'n_perm': n_perm,
-        'obs_case_mean': obs_case, 'obs_ctrl_mean': obs_ctrl,
-        'obs_diff': obs_diff, 'p_perm': p_perm,
-        'effect_size': d,
+        'n_perm': n_perm,
+        'obs_case_mean': float(obs_case_mean),
+        'obs_ctrl_mean': float(obs_ctrl_mean),
+        'obs_diff': float(obs_diff),
+        'p_perm': float(p_perm),
+        'effect_size': float(d),
     }
 
 
@@ -969,49 +986,64 @@ def dual_score_roc_auc(scores_df: pd.DataFrame, case_cols: List[str],
     return result
 
 
-def i_squared_heterogeneity(comparisons: List[dict]) -> dict:
+def i_squared_heterogeneity(comparisons: List[dict],
+                             effect_key: str = 'd_ferroptosis',
+                             var_key: str = 'var_ferroptosis') -> float:
     """
-    I² 异质性: 跨数据集效应量一致性
+    I² 异质性 (标准Q统计量): 跨数据集效应量一致性
 
-    I² = max(0, (Q - df) / Q) × 100
     Q = Σ w_i × (y_i - y_bar)²,  w_i = 1 / var_i
+    I² = max(0, (Q - df) / Q) × 100
 
-    前沿参考: Higgins & Thompson (2002) 方法, Cochrane 金标准.
+    沿用 Cochrane 金标准公式 (Higgins & Thompson 2002).
+    需传入效应量及其方差. 若数据集 < 3 或方差全缺失则返回 np.nan.
     """
-    d_ferr = [c.get('d_ferroptosis') for c in comparisons]
-    d_sene = [c.get('d_senescence') for c in comparisons]
-
-    def _calc_i2(values):
-        valid = [v for v in values if pd.notna(v)]
-        if len(valid) < 3:
-            return {'I2_pct': np.nan, 'Q': np.nan, 'df': len(valid) - 1}
-        k = len(valid)
-        y_bar = np.mean(valid)
-        var_est = np.var(valid, ddof=1)
-        # 简化: 使用等权重W
-        Q = k * var_est * (k - 1) / (np.mean(valid)**2 + 1e-12) if abs(y_bar) > 1e-8 else k
-        I2 = max(0, (Q - (k - 1)) / Q) * 100 if Q > 0 else 0
-        return {'I2_pct': I2, 'Q': Q, 'df': k - 1, 'k': k}
-
-    return {'ferroptosis_heterogeneity': _calc_i2(d_ferr),
-            'senescence_heterogeneity': _calc_i2(d_sene)}
+    valid = [(c.get(effect_key), c.get(var_key))
+             for c in comparisons
+             if pd.notna(c.get(effect_key)) and pd.notna(c.get(var_key))
+             and c.get(var_key, 0) > 0]
+    if len(valid) < 3:
+        return np.nan
+    ds, vs = zip(*valid)
+    y = np.array(ds)
+    w = 1.0 / np.array(vs)
+    y_bar = np.average(y, weights=w)
+    k = len(y)
+    Q = float(np.sum(w * (y - y_bar) ** 2))
+    df = k - 1
+    I2 = max(0, (Q - df) / Q) * 100 if Q > 0 else 0.0
+    return float(I2)
 
 
 def lodo_cross_validation(comparisons: List[dict], meta_func: callable) -> dict:
     """
     留一数据集交叉验证 (LODO): 检查 Meta 分析稳定性
 
-    每剔除一个数据集, 重新计算 Meta p 值. 若所有 LODO Meta p 方向一致 → 稳定.
+    每剔除一个数据集, 重新计算 Meta p 值.
+    meta_func 签名: (p_values, directions) → float
     """
     results = []
     for i, comp in enumerate(comparisons):
         subset = [c for j, c in enumerate(comparisons) if j != i]
-        d_ferr = [c.get('d_ferroptosis') for c in subset if pd.notna(c.get('d_ferroptosis'))]
-        d_sene = [c.get('d_senescence') for c in subset if pd.notna(c.get('d_senescence'))]
-        p_ferr = [c.get('p_ferroptosis') for c in subset if pd.notna(c.get('p_ferroptosis'))]
-        p_sene = [c.get('p_senescence') for c in subset if pd.notna(c.get('p_senescence'))]
-        meta_ferr = meta_func(p_ferr) if p_ferr else np.nan
-        meta_sene = meta_func(p_sene) if p_sene else np.nan
+
+        # 铁死亡: p值 + 效应方向
+        p_ferr = [c.get('p_ferroptosis') for c in subset
+                  if pd.notna(c.get('p_ferroptosis'))]
+        d_ferr = [c.get('d_ferroptosis') for c in subset
+                  if pd.notna(c.get('d_ferroptosis'))]
+        dir_ferr = [int(np.sign(d)) if pd.notna(d) and d != 0 else 1
+                    for d in d_ferr]
+        meta_ferr = meta_func(p_ferr, dir_ferr) if len(p_ferr) >= 2 else np.nan
+
+        # 衰老: p值 + 效应方向
+        p_sene = [c.get('p_senescence') for c in subset
+                  if pd.notna(c.get('p_senescence'))]
+        d_sene = [c.get('d_senescence') for c in subset
+                  if pd.notna(c.get('d_senescence'))]
+        dir_sene = [int(np.sign(d)) if pd.notna(d) and d != 0 else 1
+                    for d in d_sene]
+        meta_sene = meta_func(p_sene, dir_sene) if len(p_sene) >= 2 else np.nan
+
         results.append({
             'removed_dataset': comp['dataset'],
             'n_remaining': len(subset),
@@ -1437,25 +1469,13 @@ def main():
             logger.info(f"  Bootstrap IDSP: mean={boot_res['idsp_mean']:.3f}, "
                         f"95%CI=[{boot_res['idsp_ci_lower']:.3f}, {boot_res['idsp_ci_upper']:.3f}]")
 
-    # 4b. 置换检验 (基于all_meta存储的数据)
+    # 4b. 置换检验 (直接传入已计算的评分Series, 不再使用全1伪矩阵)
     perm_results = []
     for ds_name, scores_df, ccs, ctrls in all_meta:
-        for gname, gset in [('Ferroptosis', PURE_FERROPTOSIS),
-                             ('Senescence', PURE_SENESCENCE)]:
-            # 从scores_df倒推构建临时expr矩阵 (仅包含打分用基因)
-            common = [g for g in gset if g in scores_df.index]
-            if len(common) < 5:
-                continue
-            # 直接用scores_df中的值作为expr简化, 置换在样本标签上进行
+        for gname, score_col in [('Ferroptosis', 'ferroptosis'),
+                                  ('Senescence', 'senescence')]:
             perm = permutation_enrichment_test(
-                pd.DataFrame({c: [1]*len(common) for c in scores_df.index}, index=common),
-                ccs, ctrls, gset, n_perm=2000, seed=42)
-            # 修正: 用all_meta中的已计算评分替代重新计算
-            case_score = scores_df.loc[scores_df.index.isin(ccs), 'ferroptosis' if gname == 'Ferroptosis' else 'senescence'].mean()
-            ctrl_score = scores_df.loc[scores_df.index.isin(ctrls), 'ferroptosis' if gname == 'Ferroptosis' else 'senescence'].mean()
-            perm['obs_case_mean'] = case_score
-            perm['obs_ctrl_mean'] = ctrl_score
-            perm['obs_diff'] = case_score - ctrl_score
+                scores_df[score_col], ccs, ctrls, n_perm=2000, seed=42)
             perm['dataset'] = ds_name
             perm['gene_set'] = gname
             perm_results.append(perm)
@@ -1484,67 +1504,77 @@ def main():
         except Exception as e:
             logger.warning(f"  [{ds_name}] ROC跳过: {e}")
 
-    # 4d. I² 异质性
-    i2_res = i_squared_heterogeneity(all_comparisons)
-    for score_key, val in i2_res.items():
-        i2 = val.get('I2_pct')
-        if pd.notna(i2):
-            label = score_key.replace('_heterogeneity', '')
-            logger.info(f"  跨数据集 {label} I²={i2:.0f}% "
-                        f"{'(低异质性)' if i2 < 25 else '(中异质性)' if i2 < 50 else '(高异质性)'}")
+    # 4d. I² 异质性 (标准Q统计量, 使用已存储的方差)
+    i2_ferr = i_squared_heterogeneity(all_comparisons,
+                                       effect_key='d_ferroptosis',
+                                       var_key='var_ferroptosis')
+    i2_sene = i_squared_heterogeneity(all_comparisons,
+                                       effect_key='d_senescence',
+                                       var_key='var_senescence')
+    if pd.notna(i2_ferr):
+        logger.info(f"  铁死亡 跨数据集 I²={i2_ferr:.0f}% "
+                    f"{'(低异质性)' if i2_ferr < 25 else '(中异质性)' if i2_ferr < 50 else '(高异质性)'}")
+    if pd.notna(i2_sene):
+        logger.info(f"  衰老 跨数据集 I²={i2_sene:.0f}% "
+                    f"{'(低异质性)' if i2_sene < 25 else '(中异质性)' if i2_sene < 50 else '(高异质性)'}")
 
-    # 4e. LODO 交叉验证
-    meta_func = lambda pvals: stouffer_meta(pvals) if pvals else np.nan
-    lodo_df = lodo_cross_validation(all_comparisons, meta_func)
+    # 4e. LODO 交叉验证 (meta_func 需接受 (pvals, dirs) 两个参数)
+    lodo_df = lodo_cross_validation(
+        all_comparisons,
+        meta_func=lambda pvals, dirs: stouffer_meta(list(pvals), directions=list(dirs))
+        if len(pvals) >= 2 else np.nan)
     if not lodo_df.empty:
-        # 检查稳定性: 所有LODO Meta方向是否一致
         n_stable = sum(1 for _, r in lodo_df.iterrows()
                        if pd.notna(r['meta_p_ferroptosis']) and pd.notna(r['meta_p_senescence']))
         logger.info(f"  LODO: {n_stable}/{len(lodo_df)} 移除后Meta仍有效")
         lodo_df.to_csv(OUTPUT_DIR / 'L1_lodo_cross_validation.csv', index=False)
 
-    # 4f. 前沿: Stouffer 加权Meta + 随机效应Meta
+    # 4f. 前沿: Stouffer 加权Meta (带效应方向) + 随机效应Meta
     logger.info("\n  前沿Meta分析:")
-    # 准备效应量方差 (用近似公式: var_d ≈ (n_case+n_ctrl)/(n_case*n_ctrl) + d²/(2*(n_case+n_ctrl)))
-    ferr_ds = []
-    ferr_vars = []
-    sene_ds = []
-    sene_vars = []
-    for comp in all_comparisons:
-        n_c = comp.get('n_case', 0)
-        n_ct = comp.get('n_control', 0)
-        n_total = n_c + n_ct
-        if n_total < 4:
-            continue
-        d_f = comp.get('d_ferroptosis')
-        d_s = comp.get('d_senescence')
-        if pd.notna(d_f):
-            var_d_f = (n_c + n_ct) / (n_c * n_ct) + d_f**2 / (2 * n_total)
-            ferr_ds.append(d_f)
-            ferr_vars.append(var_d_f)
-        if pd.notna(d_s):
-            var_d_s = (n_c + n_ct) / (n_c * n_ct) + d_s**2 / (2 * n_total)
-            sene_ds.append(d_s)
-            sene_vars.append(var_d_s)
+    # 使用 dual_enrichment_analysis 中已存储的方差
+    ferr_ds = [c.get('d_ferroptosis') for c in all_comparisons
+               if pd.notna(c.get('d_ferroptosis')) and pd.notna(c.get('var_ferroptosis'))]
+    ferr_vars = [c.get('var_ferroptosis') for c in all_comparisons
+                 if pd.notna(c.get('d_ferroptosis')) and pd.notna(c.get('var_ferroptosis'))]
+    sene_ds = [c.get('d_senescence') for c in all_comparisons
+               if pd.notna(c.get('d_senescence')) and pd.notna(c.get('var_senescence'))]
+    sene_vars = [c.get('var_senescence') for c in all_comparisons
+                 if pd.notna(c.get('d_senescence')) and pd.notna(c.get('var_senescence'))]
 
-    # 加权Stouffer
-    comp_p_ferr = [c.get('p_ferroptosis') for c in all_comparisons if pd.notna(c.get('p_ferroptosis'))]
-    comp_p_sene = [c.get('p_senescence') for c in all_comparisons if pd.notna(c.get('p_senescence'))]
-    # 按样本量加权
-    sample_sizes = []
+    # 加权Stouffer (同步过滤 p值 + 方向 + 权重, 避免长度不匹配)
+    ferr_dir_for_p, ferr_w_for_p, ferr_p_for_p = [], [], []
     for c in all_comparisons:
+        p = c.get('p_ferroptosis')
+        d = c.get('d_ferroptosis')
         n_c, n_ct = c.get('n_case', 0), c.get('n_control', 0)
-        sample_sizes.append(np.sqrt(n_c + n_ct) if (n_c + n_ct) > 0 else 1.0)
+        if pd.notna(p) and pd.notna(d):
+            ferr_p_for_p.append(p)
+            ferr_dir_for_p.append(int(np.sign(d)) if d != 0 else 1)
+            ferr_w_for_p.append(np.sqrt(n_c + n_ct) if (n_c + n_ct) > 0 else 1.0)
 
-    if len(comp_p_ferr) >= 2:
-        w = sample_sizes[:len(comp_p_ferr)]
-        meta_p_stouffer_f = stouffer_meta(comp_p_ferr, weights=w)
-        logger.info(f"  铁死亡 Stouffer(加权) p={meta_p_stouffer_f:.4e}")
+    if len(ferr_p_for_p) >= 2:
+        meta_p_stouffer_f = stouffer_meta(
+            ferr_p_for_p, weights=ferr_w_for_p, directions=ferr_dir_for_p)
+        logger.info(f"  铁死亡 Stouffer(加权+方向) p={meta_p_stouffer_f:.4e}")
+    else:
+        meta_p_stouffer_f = np.nan
 
-    if len(comp_p_sene) >= 2:
-        w = sample_sizes[:len(comp_p_sene)]
-        meta_p_stouffer_s = stouffer_meta(comp_p_sene, weights=w)
-        logger.info(f"  衰老 Stouffer(加权) p={meta_p_stouffer_s:.4e}")
+    sene_dir_for_p, sene_w_for_p, sene_p_for_p = [], [], []
+    for c in all_comparisons:
+        p = c.get('p_senescence')
+        d = c.get('d_senescence')
+        n_c, n_ct = c.get('n_case', 0), c.get('n_control', 0)
+        if pd.notna(p) and pd.notna(d):
+            sene_p_for_p.append(p)
+            sene_dir_for_p.append(int(np.sign(d)) if d != 0 else 1)
+            sene_w_for_p.append(np.sqrt(n_c + n_ct) if (n_c + n_ct) > 0 else 1.0)
+
+    if len(sene_p_for_p) >= 2:
+        meta_p_stouffer_s = stouffer_meta(
+            sene_p_for_p, weights=sene_w_for_p, directions=sene_dir_for_p)
+        logger.info(f"  衰老 Stouffer(加权+方向) p={meta_p_stouffer_s:.4e}")
+    else:
+        meta_p_stouffer_s = np.nan
 
     # 随机效应Meta分析
     if len(ferr_ds) >= 3:
