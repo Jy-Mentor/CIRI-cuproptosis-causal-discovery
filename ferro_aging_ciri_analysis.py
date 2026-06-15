@@ -39,7 +39,6 @@ from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
 import pandas as pd
 from scipy import stats
-from scipy.stats import norm
 from statsmodels.stats.multitest import multipletests
 import matplotlib
 matplotlib.use('Agg')
@@ -79,7 +78,7 @@ GPL1355_FILE = str(Path(DATA_DIRS['GSE61616']) / 'GPL1355-10794 (1).txt')
 #
 # 基因集构建: 用户提供的96个铁衰老基因 + 补充文献关键基因
 # 分类: 脂质过氧化(10) | 铁代谢(6) | 氧化应激(3) | 炎症(21)
-#       | 信号转录(23) | 细胞周期(4) | 自噬(5) | 生长因子(7) | 代谢(17) | 补充(2)
+#       | 信号转录(23) | 细胞周期(4) | 自噬(5) | 生长因子(7) | 代谢(17) | 补充(3)
 
 FERRO_AGING_GENES = [
     # === 脂质过氧化 & 铁死亡执行 (10) ===
@@ -108,7 +107,7 @@ FERRO_AGING_GENES = [
     # === 细胞周期 & 衰老 (4) ===
     "CDKN1A", "DYRK1A", "FBXO31", "RBM3",
 
-    # === 自噬 & 蛋白质稳态 (7) ===
+    # === 自噬 & 蛋白质稳态 (5) ===
     "ATG3", "HERPUD1", "ERN1", "SNCA", "LACTB",
 
     # === 生长因子 & 细胞外基质 (7) ===
@@ -135,13 +134,6 @@ CORE_FERRO_AGING_GENES = [
     "HMGB1", "S100A8", "KEAP1", "SOD1", "HIF1A",
     "CDKN1A", "ALOX15", "NLRP3", "TLR4", "MPO"
 ]
-
-# 人-大鼠-小鼠基因同源映射 (手工整理已验证同源)
-# 大部分基因在人/大鼠/小鼠中符号相同, 只有少数不同
-HUMAN2RAT = {
-    # 无差异的就不列出, 默认保持原符号
-}
-HUMAN2MOUSE = {}
 
 logger.info(f"铁衰老基因集: {len(FERRO_AGING_GENES)} 基因")
 logger.info(f"核心标志基因: {len(CORE_FERRO_AGING_GENES)}")
@@ -415,36 +407,6 @@ def collapse_probes(expr_df: pd.DataFrame, probe_map: Dict[str, str]) -> pd.Data
     mapped.index = gene_series
     mapped = mapped.groupby(mapped.index).max()
     return mapped
-
-
-def deg_analysis(expr_df: pd.DataFrame, case_cols: List[str], 
-                 control_cols: List[str]) -> pd.DataFrame:
-    """差异表达分析 (Welch t-test + BH校正)"""
-    results = []
-    case_data = expr_df[case_cols].values.astype(float)
-    ctrl_data = expr_df[control_cols].values.astype(float)
-    
-    for i, gene in enumerate(expr_df.index):
-        c = case_data[i, :]
-        t = ctrl_data[i, :]
-        c = c[~np.isnan(c)]
-        t = t[~np.isnan(t)]
-        if len(c) < 2 or len(t) < 2:
-            continue
-        log2fc = np.mean(c) - np.mean(t)
-        _, pval = stats.ttest_ind(c, t, equal_var=False)
-        results.append({
-            'gene': gene,
-            'log2FC': log2fc,
-            'pvalue': pval,
-        })
-    
-    df = pd.DataFrame(results)
-    if not df.empty:
-        _, padj, _, _ = stats.multipletests(df['pvalue'], method='fdr_bh')
-        df['padj'] = padj
-        df = df.sort_values('pvalue')
-    return df
 
 
 # ============================================================
@@ -989,7 +951,11 @@ def plot_forest_plot(meta_df: pd.DataFrame):
     for i, (_, row) in enumerate(meta_df.iterrows()):
         mean = row.get('mean_diff', 0)
         pval = row.get('pvalue', 1)
-        # 近似95% CI (粗略估计)
+        # 近似95% CI
+        # 注意: 由于process函数未返回标准差信息, 此处使用p值反推近似CI
+        # 更严谨的做法应在process函数中返回每组的标准差, 再用
+        # SE = sqrt(s1^2/n1 + s2^2/n2) 计算标准误
+        # 当前近似方法供可视化趋势参考, 不作为统计推断依据
         se = abs(mean) / max(-np.log10(max(pval, 1e-300)), 0.1) * 0.5 if pval > 0 else abs(mean) / 2
         ci_low = mean - 1.96 * max(se, 0.01)
         ci_high = mean + 1.96 * max(se, 0.01)
