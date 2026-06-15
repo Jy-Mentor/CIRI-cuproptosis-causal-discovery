@@ -48,9 +48,8 @@ except ImportError as e:
     print(f"错误: 缺少依赖包 ({e})")
     sys.exit(1)
 
-# 路径配置
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import RESULTS_DIR, CUPROPTOSIS_GENES, BCP_TARGETS
+# 路径配置 - 使用统一导入接口
+from pipeline_scripts import RESULTS_DIR, CUPROPTOSIS_GENES, BCP_TARGETS
 
 STAGE_DIR = os.path.join(RESULTS_DIR, "stage6_graphsage_knockout")
 os.makedirs(STAGE_DIR, exist_ok=True)

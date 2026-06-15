@@ -48,11 +48,10 @@ except ImportError as e:
     print(f"Error: Missing dependencies ({e})")
     sys.exit(1)
 
-# Path configuration
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import (
+# Path configuration - 使用统一导入接口
+from pipeline_scripts import (
     RESULTS_DIR, CUPROPTOSIS_GENES, CUPROPTOSIS_RELATED,
-    CUPROPTOSIS_PATHWAY_SCORES, BCP_TARGETS, HOUSEKEEPING_GENES
+    CUPROPTOSIS_PATHWAY_SCORES, BCP_TARGETS, HOUSEKEEPING_GENES,
 )
 
 STAGE_DIR = os.path.join(RESULTS_DIR, "stage8_final_targets")

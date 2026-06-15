@@ -36,8 +36,8 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import RESULTS_DIR, CUPROPTOSIS_GENES, BCP_TARGETS
+# 路径配置 - 使用统一导入接口
+from pipeline_scripts import RESULTS_DIR, CUPROPTOSIS_GENES, BCP_TARGETS
 from scripts.utils import setup_logger
 
 STAGE_DIR = os.path.join(RESULTS_DIR, "stage5_string_ppi")

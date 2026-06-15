@@ -16,12 +16,13 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import (
+# 路径配置 - 使用统一导入接口
+from pipeline_scripts import (
     BASE_DIR, RESULTS_DIR, DATA_DIR,
-    RAT_MOUSE_HUMAN_MAP, CUPROPTOSIS_GENES, CUPROPTOSIS_RELATED,
-    BCP_TARGETS, FIG_FORMAT, FIG_DPI
+    CUPROPTOSIS_GENES, CUPROPTOSIS_RELATED,
+    BCP_TARGETS, FIG_FORMAT, FIG_DPI,
 )
+from config import RAT_MOUSE_HUMAN_MAP
 from scripts.utils import setup_logger, ensure_dir
 
 STAGE_DIR = os.path.join(RESULTS_DIR, "stage4_seed_wgcna")

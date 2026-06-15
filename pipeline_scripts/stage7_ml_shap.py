@@ -62,9 +62,8 @@ except ImportError as e:
     print(f"Error: Missing dependencies ({e})")
     sys.exit(1)
 
-# Path configuration
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import RESULTS_DIR
+# Path configuration - 使用统一导入接口
+from pipeline_scripts import RESULTS_DIR
 
 STAGE_DIR = os.path.join(RESULTS_DIR, "stage7_ml_shap")
 os.makedirs(STAGE_DIR, exist_ok=True)

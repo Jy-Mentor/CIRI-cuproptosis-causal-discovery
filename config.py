@@ -427,3 +427,58 @@ STAGE_OUTPUTS['brain_coexpression'] = {
 
 print(f"Brain coexpression: {'Enabled' if BRAIN_COEXPRESSION_ENABLED else 'Disabled'}")
 
+# ============================================================
+# 12. Configuration Validation (v2.0)
+# ============================================================
+def validate_config():
+    """验证配置加载的正确性和完整性"""
+    issues = []
+
+    # 验证BCP_TARGETS
+    if not BCP_TARGETS:
+        issues.append("BCP_TARGETS 为空，请检查 tiered_targets.csv 或 _RAW_BCP_TARGETS")
+    else:
+        print(f"  Config OK - BCP_TARGETS: {len(BCP_TARGETS)} targets")
+
+    # 验证铜死亡基因
+    if not CUPROPTOSIS_GENES:
+        issues.append("CUPROPTOSIS_GENES 为空")
+    else:
+        print(f"  Config OK - CUPROPTOSIS_GENES: {len(CUPROPTOSIS_GENES)} genes")
+
+    if not CUPROPTOSIS_RELATED:
+        issues.append("CUPROPTOSIS_RELATED 为空")
+    else:
+        print(f"  Config OK - CUPROPTOSIS_RELATED: {len(CUPROPTOSIS_RELATED)} genes")
+
+    # 验证路径
+    for path_name, path_value in [
+        ("BASE_DIR", BASE_DIR),
+        ("DATA_DIR", DATA_DIR),
+        ("RESULTS_DIR", RESULTS_DIR),
+    ]:
+        if not os.path.exists(path_value):
+            try:
+                os.makedirs(path_value, exist_ok=True)
+                print(f"  Config OK - {path_name}: created ({path_value})")
+            except Exception as e:
+                issues.append(f"{path_name} 路径创建失败: {path_value}, 错误: {e}")
+
+    # 验证DEVICE
+    print(f"  Config OK - DEVICE: {DEVICE}")
+
+    if issues:
+        print("!")
+        print("!" * 60)
+        for issue in issues:
+            print(f"! 配置警告: {issue}")
+        print("!" * 60)
+        print("!")
+    else:
+        print(f"  Config validation passed")
+
+    return len(issues) == 0
+
+
+validate_config()
+

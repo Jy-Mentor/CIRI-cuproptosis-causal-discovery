@@ -16,10 +16,13 @@ import pandas as pd
 import scanpy as sc
 from scipy import sparse
 
-# 路径配置
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import RESULTS_DIR, SC_QC_MIN_GENES, SC_QC_MAX_GENES, SC_QC_MIN_COUNTS, SC_QC_MAX_COUNTS
-from config import SC_QC_MAX_MITO, SC_N_HVGS, SC_N_PCS, SC_KNN_NEIGHBORS, SC_RESOLUTION, DATA_DIR, CUPROPTOSIS_GENES, CUPROPTOSIS_RELATED
+# 路径配置 - 使用统一导入接口
+from pipeline_scripts import (
+    RESULTS_DIR, DATA_DIR,
+    CUPROPTOSIS_GENES, CUPROPTOSIS_RELATED,
+    SC_QC_MIN_GENES, SC_QC_MAX_GENES, SC_QC_MIN_COUNTS, SC_QC_MAX_COUNTS,
+    SC_QC_MAX_MITO, SC_N_HVGS, SC_N_PCS, SC_KNN_NEIGHBORS, SC_RESOLUTION,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-8s | %(message)s')
 logger = logging.getLogger(__name__)
