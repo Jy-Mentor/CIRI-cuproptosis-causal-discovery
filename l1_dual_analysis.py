@@ -382,8 +382,11 @@ def dual_enrichment_analysis(expr_df: pd.DataFrame, dataset_name: str,
         'var_ferroptosis': var_ferr, 'var_senescence': var_sene,
     }
 
-    logger.info(f"  [{dataset_name}] r={r_all:.3f}, d_ferr={d_ferr:.3f}, d_sene={d_sene:.3f}, "
-                f"p_ferr={p_ferr:.4e}, p_sene={p_sene:.4e}")
+    if pd.notna(r_all):
+        logger.info(f"  [{dataset_name}] r={r_all:.3f}, d_ferr={d_ferr:.3f}, d_sene={d_sene:.3f}, "
+                    f"p_ferr={p_ferr:.4e}, p_sene={p_sene:.4e}")
+    else:
+        logger.info(f"  [{dataset_name}] 双评分统计不可用 (交集不足或样本量过小)")
 
     return scores_df, comparison
 
