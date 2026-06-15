@@ -15,14 +15,13 @@
   - GSE104036 (小鼠, RNA-seq, 多时间点 MCAO)
 
 方法:
-  1. ssGSEA: 每个样本计算ferro-aging评分
+  1. 秩和富集评分: 每个样本计算ferro-aging评分
   2. 差异检验: CIRI组 vs 对照组
   3. 跨数据集Meta分析: Fisher合并p值
   4. 单基因分析: 关键铁衰老基因表达变化
 
 输出:
   - ferro_aging_ciri_results.xlsx (多Sheet)
-  - ferro_aging_ciri_figures/ (箱线图PDF)
 
 创新点:
   - 首次将"ferro-aging"概念引入CIRI研究领域
@@ -40,9 +39,6 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -53,9 +49,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "ferro_aging_ciri_results"
-FIG_DIR = OUTPUT_DIR / "figures"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 # 数据集路径
 DATA_DIRS = {
@@ -139,24 +133,40 @@ logger.info(f"核心标志基因: {len(CORE_FERRO_AGING_GENES)}")
 
 
 # ============================================================
-# 2. ssGSEA (单样本基因集富集分析) 实现
+# 2. 效应量工具函数
 # ============================================================
 
-def ssgsea_score(expr: np.ndarray, gene_mask: np.ndarray) -> float:
+def cohens_d(case: np.ndarray, control: np.ndarray) -> float:
+    """计算Cohen's d效应量 (pooled标准差)"""
+    n1, n2 = len(case), len(control)
+    s1, s2 = np.var(case, ddof=1), np.var(control, ddof=1)
+    pooled = np.sqrt(((n1 - 1) * s1 + (n2 - 1) * s2) / (n1 + n2 - 2))
+    return (np.mean(case) - np.mean(control)) / pooled if pooled > 0 else 0.0
+
+
+# ============================================================
+# 3. 秩和富集评分 (单样本)
+# ============================================================
+
+def rank_sum_enrichment_score(expr: np.ndarray, gene_mask: np.ndarray) -> float:
     """
-    计算单样本GSEA评分 (秩和累积法)
+    计算秩和富集评分 (单样本)
     
-    原理:
+    注意: 非标准ssGSEA (非ECDF积分差), 而是内部的秩和富集度量:
       1. 对样本中所有基因的表达值排序
-      2. 计算基因集内基因的秩次累积和
-      3. 减去随机期望, 归一化
+      2. 计算基因集内基因的秩次总和, 减去随机期望
+      3. 除以基因集大小归一化
+    
+    与标准ssGSEA的区别:
+      - 标准ssGSEA: 两类ECDF累积积分差 (需用gseapy库)
+      - 本方法: 秩次总和偏差, 计算更轻量, 趋势一致但数值分布不同
     
     Args:
         expr: (n_genes,) 该样本的所有基因表达值
         gene_mask: (n_genes,) 基因集成员的布尔掩码
     
     Returns:
-        float: ssGSEA评分 (正值=富集, 负值=抑制)
+        float: 富集评分 (正值=富集, 负值=抑制)
     """
     n_genes = len(expr)
     n_set = gene_mask.sum()
@@ -185,16 +195,17 @@ def ssgsea_score(expr: np.ndarray, gene_mask: np.ndarray) -> float:
     return float(score)
 
 
-def compute_ssgsea_matrix(expr_df: pd.DataFrame, gene_set: Set[str]) -> pd.Series:
+def compute_enrichment_score_matrix(expr_df: pd.DataFrame, gene_set: Set[str]) -> pd.Series:
     """
-    对表达矩阵所有样本计算ssGSEA评分
+    对表达矩阵所有样本计算秩和富集评分
     
-    Args:
+    调用 rank_sum_enrichment_score 逐样本计算。
+    注意: 非标准ssGSEA, 详见 rank_sum_enrichment_score 注释。
         expr_df: 基因×样本表达矩阵 (index=基因symbol, columns=样本)
         gene_set: 目标基因集
     
     Returns:
-        Series: 每个样本的ssGSEA评分
+        Series: 每个样本的富集评分
     """
     # 找到基因集中存在于矩阵中的基因
     common_genes = [g for g in gene_set if g in expr_df.index]
@@ -212,10 +223,10 @@ def compute_ssgsea_matrix(expr_df: pd.DataFrame, gene_set: Set[str]) -> pd.Serie
         if valid.sum() < 50:
             scores[col] = np.nan
             continue
-        scores[col] = ssgsea_score(vals[valid], gene_mask[valid])
+        scores[col] = rank_sum_enrichment_score(vals[valid], gene_mask[valid])
     
     result = pd.Series(scores)
-    logger.info(f"  ssGSEA完成: {len(common_genes)}/{len(gene_set)} 基因匹配, "
+    logger.info(f"  富集评分计算完成: {len(common_genes)}/{len(gene_set)} 基因匹配, "
                 f"{result.notna().sum()} 样本有效")
     return result
 
@@ -241,32 +252,42 @@ def analyze_signature_genes(
     Returns:
         DataFrame: [gene, mean_case, mean_control, log2FC, pvalue, padj]
     """
+    # 安全过滤: 确保传入列名存在于expr_df中, 避免loc KeyError
+    case_cols = [c for c in case_cols if c in expr_df.columns]
+    control_cols = [c for c in control_cols if c in expr_df.columns]
+    if not case_cols or not control_cols:
+        return pd.DataFrame()
+    
     common = [g for g in expr_df.index if g in gene_set]
     results = []
     
     for gene in common:
-        case_vals = expr_df.loc[gene, case_cols].values.astype(float)
-        ctrl_vals = expr_df.loc[gene, control_cols].values.astype(float)
-        case_vals = case_vals[~np.isnan(case_vals)]
-        ctrl_vals = ctrl_vals[~np.isnan(ctrl_vals)]
+        raw_case = expr_df.loc[gene, case_cols].values.astype(float)
+        raw_ctrl = expr_df.loc[gene, control_cols].values.astype(float)
         
-        if len(case_vals) < 2 or len(ctrl_vals) < 2:
-            continue
-        
-        # 对于配对检验, 需对齐有效值对
         if paired:
-            paired_case = expr_df.loc[gene, case_cols].values.astype(float)
-            paired_ctrl = expr_df.loc[gene, control_cols].values.astype(float)
-            valid = ~(np.isnan(paired_case) | np.isnan(paired_ctrl))
+            # 配对检验: 保留完整对应对, 同时过滤NaN
+            valid = ~(np.isnan(raw_case) | np.isnan(raw_ctrl))
             if valid.sum() < 3:
                 continue
-            case_vals = paired_case[valid]
-            ctrl_vals = paired_ctrl[valid]
+            case_vals = raw_case[valid]
+            ctrl_vals = raw_ctrl[valid]
+        else:
+            # 独立检验: 分别过滤NaN
+            case_vals = raw_case[~np.isnan(raw_case)]
+            ctrl_vals = raw_ctrl[~np.isnan(raw_ctrl)]
+            if len(case_vals) < 2 or len(ctrl_vals) < 2:
+                continue
         
         mean_case = np.mean(case_vals)
         mean_ctrl = np.mean(ctrl_vals)
         
-        # 对于log表达矩阵, log2FC = mean_case - mean_ctrl
+        # log2FC = mean_case - mean_ctrl
+        # 假设: 表达矩阵已为log2空间
+        #   - Affy芯片(RMA/PLIER/MAS5): 默认log2尺度 ✓
+        #   - Illumina BeadArray: 通常为log2尺度 ✓
+        #   - GSE104036 RNA-seq: 已转为log2(CPM+1) ✓
+        #   - 结论: 对所有数据集这假设成立, 差值即log2倍变化
         log2fc = mean_case - mean_ctrl
         
         # t检验
@@ -341,28 +362,32 @@ def parse_series_matrix(filepath: str) -> pd.DataFrame:
         content = f.read()
     
     lines = content.splitlines()
-    data_start = None
-    header_line = None
+    header_idx = None
     
     for i, line in enumerate(lines):
         if line.startswith('!series_matrix_table_begin'):
-            data_start = i + 1
-            header_line = i + 1
+            # 跳过表头后的空行
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            header_idx = j
             break
     
-    if data_start is None:
+    if header_idx is None:
         raise ValueError(f"无法找到series_matrix_table_begin: {filepath}")
     
     # 解析表头
-    header = lines[header_line].strip().split('\t')
+    header = lines[header_idx].strip().split('\t')
     header = [h.strip('"').strip() for h in header]
     
-    # 解析数据
+    # 解析数据 (从表头下一行开始, 跳过空行, 直到 !series_matrix_table_end)
     data_lines = []
-    for i in range(data_start + 1, len(lines)):
+    for i in range(header_idx + 1, len(lines)):
         if lines[i].startswith('!series_matrix_table_end'):
             break
-        data_lines.append(lines[i])
+        stripped = lines[i].strip()
+        if stripped:  # 跳过空行
+            data_lines.append(lines[i])
     
     data = []
     index = []
@@ -436,7 +461,7 @@ def collapse_probes(expr_df: pd.DataFrame, probe_map: Dict[str, str]) -> pd.Data
 # 5a. GSE16561 (人全血, Stroke vs Control)
 # ============================================================
 
-def process_gse16561() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def process_gse16561() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, List[str], List[str]]:
     """处理GSE16561"""
     logger.info("=" * 50)
     logger.info("[GSE16561] 人全血: Stroke vs Control")
@@ -506,7 +531,7 @@ def process_gse16561() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         expr_gene = expr_df
     
     # ssGSEA
-    fa_score = compute_ssgsea_matrix(expr_gene, set(FERRO_AGING_GENES))
+    fa_score = compute_enrichment_score_matrix(expr_gene, set(FERRO_AGING_GENES))
     
     # 统计检验
     case_scores = fa_score[[c for c in stroke_cols if c in fa_score.index]].dropna()
@@ -528,6 +553,7 @@ def process_gse16561() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         'std_case': float(case_scores.std()) if len(case_scores) > 1 else 0.0,
         'std_control': float(ctrl_scores.std()) if len(ctrl_scores) > 1 else 0.0,
         'mean_diff': mean_diff, 'pvalue': pval,
+        'cohens_d': round(cohens_d(case_scores.values, ctrl_scores.values), 4),
     }), list(stroke_cols), list(control_cols)
 
 
@@ -535,7 +561,7 @@ def process_gse16561() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
 # 5b. GSE37587 (人全血, 配对 Follow-Up vs Baseline)
 # ============================================================
 
-def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, List[str], List[str]]:
     """处理GSE37587 (配对设计)"""
     logger.info("=" * 50)
     logger.info("[GSE37587] 人全血: Follow-Up vs Baseline (配对)")
@@ -551,21 +577,18 @@ def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         lines = f.readlines()
     
     sample_line = None
-    title_line = None
     desc_line = None
     for l in lines:
         if l.startswith('!Sample_geo_accession'):
             sample_line = [x.strip('"').strip() for x in l.strip().split('\t')]
-        if l.startswith('!Sample_title'):
-            title_line = [x.strip('"').strip() for x in l.strip().split('\t')]
         if l.startswith('!Sample_description'):
             desc_line = [x.strip('"').strip() for x in l.strip().split('\t')]
     
-    # 从description解析分组和配对信息, 避免title中数字干扰
+    # 从description解析分组和配对信息
     followup_cols = []
     baseline_cols = []
     patient_pairs = []  # patient_id -> group -> gsm
-    
+
     for i, gsm in enumerate(sample_line[1:], 1):
         desc = desc_line[i] if i < len(desc_line) else ''
         desc_lower = desc.lower()
@@ -619,7 +642,7 @@ def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     expr_gene = collapse_probes(expr_df, probe_map)
     
     # ssGSEA
-    fa_score = compute_ssgsea_matrix(expr_gene, set(FERRO_AGING_GENES))
+    fa_score = compute_enrichment_score_matrix(expr_gene, set(FERRO_AGING_GENES))
     
     case_scores = fa_score[[c for c in followup_cols if c in fa_score.index]].dropna()
     ctrl_scores = fa_score[[c for c in baseline_cols if c in fa_score.index]].dropna()
@@ -627,6 +650,8 @@ def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     # 配对t检验 (优先, 因实验设计为配对)
     pval = None
     pair_df = pd.DataFrame(patient_pairs)
+    common_patients = []
+    bl_arr = np.array([])  # 预初始化用于d_z计算
     if not pair_df.empty:
         baseline_map = pair_df[pair_df['group']=='baseline'].set_index('patient')['gsm'].to_dict()
         followup_map = pair_df[pair_df['group']=='followup'].set_index('patient')['gsm'].to_dict()
@@ -652,9 +677,32 @@ def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     logger.info(f"  Ferro-aging评分: FU={case_scores.mean():.3f}, "
                 f"BL={ctrl_scores.mean():.3f}, Δ={mean_diff:.3f}, p={pval:.4e}")
     
-    gene_df = analyze_signature_genes(expr_gene, followup_cols, baseline_cols,
-                                       set(FERRO_AGING_GENES), 'GSE37587',
-                                       paired=True)
+    # 构建对齐的配对列用于单基因分析
+    if (not pair_df.empty and len(common_patients) >= 3):
+        baseline_ordered = [baseline_map[p] for p in common_patients
+                            if baseline_map[p] in expr_gene.columns and
+                               followup_map[p] in expr_gene.columns]
+        followup_ordered = [followup_map[p] for p in common_patients
+                            if baseline_map[p] in expr_gene.columns and
+                               followup_map[p] in expr_gene.columns]
+        if len(baseline_ordered) >= 3:
+            gene_df = analyze_signature_genes(expr_gene, followup_ordered, baseline_ordered,
+                                               set(FERRO_AGING_GENES), 'GSE37587',
+                                               paired=True)
+        else:
+            gene_df = analyze_signature_genes(expr_gene, followup_cols, baseline_cols,
+                                               set(FERRO_AGING_GENES), 'GSE37587',
+                                               paired=False)
+    else:
+        gene_df = analyze_signature_genes(expr_gene, followup_cols, baseline_cols,
+                                           set(FERRO_AGING_GENES), 'GSE37587',
+                                           paired=False)
+
+    # 配对Cohen's d_z (差值均值/差值标准差)
+    dz_val = np.nan
+    if len(bl_arr) >= 3 and len(fu_arr) >= 3:
+        diff = fu_arr - bl_arr
+        dz_val = round(np.mean(diff) / np.std(diff, ddof=1), 4)
     
     return fa_score, gene_df, pd.Series({
         'dataset': 'GSE37587', 'species': 'Human', 'tissue': 'Whole Blood',
@@ -664,6 +712,7 @@ def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         'std_case': float(case_scores.std()) if len(case_scores) > 1 else 0.0,
         'std_control': float(ctrl_scores.std()) if len(ctrl_scores) > 1 else 0.0,
         'mean_diff': mean_diff, 'pvalue': pval,
+        'cohens_d': dz_val if not np.isnan(dz_val) else round(cohens_d(case_scores.values, ctrl_scores.values), 4),
     }), list(followup_cols), list(baseline_cols)
 
 
@@ -671,7 +720,7 @@ def process_gse37587() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
 # 5c. GSE61616 (大鼠, MCAO 7d)
 # ============================================================
 
-def process_gse61616() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def process_gse61616() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, List[str], List[str]]:
     """处理GSE61616 (大鼠Affy芯片, MCAO 7d)"""
     logger.info("=" * 50)
     logger.info("[GSE61616] 大鼠 MCAO 7d: Model vs Sham")
@@ -711,7 +760,7 @@ def process_gse61616() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     expr_gene = collapse_probes(expr_df, probe_map)
     
     # ssGSEA (大鼠基因映射)
-    fa_score = compute_ssgsea_matrix(expr_gene, set(FERRO_AGING_GENES))
+    fa_score = compute_enrichment_score_matrix(expr_gene, set(FERRO_AGING_GENES))
     
     case_scores = fa_score[[c for c in model_cols if c in fa_score.index]].dropna()
     ctrl_scores = fa_score[[c for c in sham_cols if c in fa_score.index]].dropna()
@@ -731,6 +780,7 @@ def process_gse61616() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         'std_case': float(case_scores.std()) if len(case_scores) > 1 else 0.0,
         'std_control': float(ctrl_scores.std()) if len(ctrl_scores) > 1 else 0.0,
         'mean_diff': mean_diff, 'pvalue': pval,
+        'cohens_d': round(cohens_d(case_scores.values, ctrl_scores.values), 4),
     }), list(model_cols), list(sham_cols)
 
 
@@ -738,7 +788,7 @@ def process_gse61616() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
 # 5d. GSE97537 (大鼠, MCAO 24h)
 # ============================================================
 
-def process_gse97537() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def process_gse97537() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, List[str], List[str]]:
     """处理GSE97537 (大鼠Affy芯片, MCAO 24h)"""
     logger.info("=" * 50)
     logger.info("[GSE97537] 大鼠 MCAO 24h: Model vs Sham")
@@ -776,7 +826,7 @@ def process_gse97537() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         probe_map = parse_gpl1355_annotation(GPL1355_FILE)
     expr_gene = collapse_probes(expr_df, probe_map)
     
-    fa_score = compute_ssgsea_matrix(expr_gene, set(FERRO_AGING_GENES))
+    fa_score = compute_enrichment_score_matrix(expr_gene, set(FERRO_AGING_GENES))
     
     case_scores = fa_score[[c for c in mcao_cols if c in fa_score.index]].dropna()
     ctrl_scores = fa_score[[c for c in sham_cols if c in fa_score.index]].dropna()
@@ -796,6 +846,7 @@ def process_gse97537() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         'std_case': float(case_scores.std()) if len(case_scores) > 1 else 0.0,
         'std_control': float(ctrl_scores.std()) if len(ctrl_scores) > 1 else 0.0,
         'mean_diff': mean_diff, 'pvalue': pval,
+        'cohens_d': round(cohens_d(case_scores.values, ctrl_scores.values), 4),
     }), list(mcao_cols), list(sham_cols)
 
 
@@ -803,7 +854,7 @@ def process_gse97537() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
 # 5e. GSE104036 (小鼠, RNA-seq, 多时间点)
 # ============================================================
 
-def process_gse104036() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def process_gse104036() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, List[str], List[str]]:
     """处理GSE104036 (小鼠RNA-seq, 3hr/6hr/12hr/24hr MCAO)"""
     logger.info("=" * 50)
     logger.info("[GSE104036] 小鼠 RNA-seq: 多时间点 MCAO vs Sham")
@@ -838,36 +889,51 @@ def process_gse104036() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     
     # 样本分组: 使用模糊匹配替代硬编码
     # 列名格式: S1, S2, S3 (sham) | I1_3hr, I2_6hr, I3_24hr (ipsilateral)
+    # 使用关键词匹配: 排除sham列和C前缀(对侧)列, 按时间关键词匹配
     all_cols = expr_df.columns.tolist()
     logger.info(f"  列名: {all_cols}")
     
     sham_cols = sorted([c for c in all_cols 
                         if re.match(r'^S\d+', str(c)) or 'sham' in str(c).lower()])
-    ipso_3hr = sorted([c for c in all_cols if re.match(r'^I\d+.*3h', str(c), re.IGNORECASE)])
-    ipso_6hr = sorted([c for c in all_cols if re.match(r'^I\d+.*6h', str(c), re.IGNORECASE)])
-    ipso_12hr = sorted([c for c in all_cols if re.match(r'^I\d+.*12h', str(c), re.IGNORECASE)])
-    ipso_24hr = sorted([c for c in all_cols if re.match(r'^I\d+.*24h', str(c), re.IGNORECASE)])
+    
+    ipsi_candidates = [c for c in all_cols 
+                       if 'sham' not in str(c).lower()
+                       and not re.match(r'^C\d+', str(c))]  # 排除对侧(C前缀)
+    ipsi_3hr = sorted([c for c in ipsi_candidates if re.search(r'(?i)3h', str(c))])
+    ipsi_6hr = sorted([c for c in ipsi_candidates if re.search(r'(?i)6h', str(c))])
+    ipsi_12hr = sorted([c for c in ipsi_candidates if re.search(r'(?i)12h', str(c))])
+    ipsi_24hr = sorted([c for c in ipsi_candidates if re.search(r'(?i)24h', str(c))])
     
     # 合并所有ipsi时间点 vs sham
-    ipsi_all = ipso_3hr + ipso_6hr + ipso_12hr + ipso_24hr
+    ipsi_all = ipsi_3hr + ipsi_6hr + ipsi_12hr + ipsi_24hr
     
     # RNA-seq数据: log2(CPM+1) 转换用于ssGSEA
     # 如果是count数据, 先归一化
-    if expr_df.max().max() > 100:
-        logger.info("  检测到raw counts, 执行log2(CPM+1)转换")
+    # 判断是否为raw counts需要log转换
+    # 准则: 最大值>50 且 中列值>5 且 大部分为整数 -> 视为raw counts
+    flat = expr_df.values.flatten()
+    flat = flat[~np.isnan(flat)]
+    max_val = np.max(flat)
+    median_val = np.median(flat)
+    int_ratio = np.mean(flat == np.floor(flat))  # 整数比例
+    if max_val > 50 and median_val > 5 and int_ratio > 0.5:
+        logger.info(f"  检测到raw counts (max={max_val:.0f}, median={median_val:.0f}, "
+                    f"int_ratio={int_ratio:.0%}), 执行log2(CPM+1)转换")
         col_sums = expr_df.sum()
         cpm = expr_df.div(col_sums, axis=1) * 1e6
         expr_df = np.log2(cpm + 1)
+    else:
+        logger.info(f"  数据已是log空间或归一化后表达值 (max={max_val:.1f}), 跳过转换")
     
     logger.info(f"  Sham={len(sham_cols)}, Ipsi_all={len(ipsi_all)}, "
-                f"3hr={len(ipso_3hr)}, 6hr={len(ipso_6hr)}, "
-                f"12hr={len(ipso_12hr)}, 24hr={len(ipso_24hr)}")
+                f"3hr={len(ipsi_3hr)}, 6hr={len(ipsi_6hr)}, "
+                f"12hr={len(ipsi_12hr)}, 24hr={len(ipsi_24hr)}")
     
     if not sham_cols:
         raise ValueError("GSE104036: 无法识别Sham样本")
     
     # ssGSEA
-    fa_score = compute_ssgsea_matrix(expr_df, set(FERRO_AGING_GENES))
+    fa_score = compute_enrichment_score_matrix(expr_df, set(FERRO_AGING_GENES))
     
     case_scores = fa_score[[c for c in ipsi_all if c in fa_score.index]].dropna()
     ctrl_scores = fa_score[[c for c in sham_cols if c in fa_score.index]].dropna()
@@ -881,8 +947,8 @@ def process_gse104036() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     
     # 分时间点分析
     timepoint_results = {}
-    for tp_name, tp_cols in [('3hr', ipso_3hr), ('6hr', ipso_6hr),
-                              ('12hr', ipso_12hr), ('24hr', ipso_24hr)]:
+    for tp_name, tp_cols in [('3hr', ipsi_3hr), ('6hr', ipsi_6hr),
+                              ('12hr', ipsi_12hr), ('24hr', ipsi_24hr)]:
         if len(tp_cols) >= 2:
             tp_scores_case = fa_score[[c for c in tp_cols if c in fa_score.index]].dropna()
             if not tp_scores_case.empty and not ctrl_scores.empty:
@@ -902,172 +968,11 @@ def process_gse104036() -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         'std_case': float(case_scores.std()) if len(case_scores) > 1 else 0.0,
         'std_control': float(ctrl_scores.std()) if len(ctrl_scores) > 1 else 0.0,
         'mean_diff': mean_diff, 'pvalue': pval,
+        'cohens_d': round(cohens_d(case_scores.values, ctrl_scores.values), 4),
         'timepoints': json.dumps({k: {kk: float(vv) if isinstance(vv, np.floating) else vv 
                                        for kk, vv in v.items()} 
                                   for k, v in timepoint_results.items()}),
     }), list(ipsi_all), list(sham_cols)
-
-
-# ============================================================
-# 6. 可视化
-# ============================================================
-
-def plot_ferro_aging_scores(
-    all_scores: Dict[str, pd.Series],
-    all_stats: Dict[str, pd.Series],
-    all_groups: Dict[str, Tuple[List[str], List[str]]],
-):
-    """绘制各数据集的铁衰老评分箱线图 (使用传入的case/control列名分组)"""
-    n_datasets = len(all_scores)
-    fig, axes = plt.subplots(1, n_datasets, figsize=(5 * n_datasets, 5))
-    if n_datasets == 1:
-        axes = [axes]
-    
-    colors = {'case': '#E74C3C', 'control': '#3498DB'}
-    
-    for ax, ds_name in zip(axes, all_scores.keys()):
-        scores = all_scores[ds_name]
-        stat = all_stats.get(ds_name)
-        groups = all_groups.get(ds_name)
-        if stat is None or groups is None:
-            continue
-        
-        case_cols, control_cols = groups
-        case_label = stat.get('case_label', 'Case')
-        ctrl_label = stat.get('control_label', 'Control')
-        
-        # 直接使用列名索引，不再做关键词匹配
-        case_vals = scores[case_cols].dropna().values.tolist() if case_cols else []
-        ctrl_vals = scores[control_cols].dropna().values.tolist() if control_cols else []
-        
-        # 如果都没有有效值，用统计量保底
-        if not case_vals:
-            case_vals = [stat.get('mean_case', 0)]
-        if not ctrl_vals:
-            ctrl_vals = [stat.get('mean_control', 0)]
-        
-        # 箱线图
-        bp = ax.boxplot([ctrl_vals, case_vals], positions=[0, 1], widths=0.5,
-                         patch_artist=True,
-                         boxprops=dict(linewidth=1.5),
-                         whiskerprops=dict(linewidth=1.5),
-                         capprops=dict(linewidth=1.5),
-                         medianprops=dict(linewidth=2, color='black'))
-        
-        bp['boxes'][0].set_facecolor(colors['control'])
-        bp['boxes'][1].set_facecolor(colors['case'])
-        
-        # 散点
-        np.random.seed(42)
-        for pos, vals, color in [(0, ctrl_vals, colors['control']),
-                                  (1, case_vals, colors['case'])]:
-            # 动态jitter (样本量越小, jitter越小)
-            jitter_scale = max(0.02, min(0.08, 0.25 / np.sqrt(len(vals))))
-            jitter = np.random.normal(0, jitter_scale, len(vals))
-            ax.scatter(np.full_like(vals, pos) + jitter, vals,
-                      alpha=0.7, s=30, color=color, edgecolors='white', 
-                      linewidth=0.5, zorder=5)
-        
-        # p值标注
-        pval = stat.get('pvalue', 1.0)
-        p_text = f"p = {pval:.2e}" if pval > 1e-99 else "p < 1e-99"
-        if pval < 0.001:
-            sig = '***'
-        elif pval < 0.01:
-            sig = '**'
-        elif pval < 0.05:
-            sig = '*'
-        else:
-            sig = 'ns'
-        
-        y_max = max(max(case_vals) if case_vals else 0, 
-                    max(ctrl_vals) if ctrl_vals else 0)
-        y_min = min(min(case_vals) if case_vals else 0, 
-                    min(ctrl_vals) if ctrl_vals else 0)
-        y_range = y_max - y_min if y_max != y_min else 1
-        
-        # 显著性标注线
-        ax.plot([0, 0, 1, 1], [y_max + y_range * 0.1, y_max + y_range * 0.15,
-                               y_max + y_range * 0.15, y_max + y_range * 0.1],
-               color='black', linewidth=1)
-        ax.text(0.5, y_max + y_range * 0.18, f'{sig}\n{p_text}', 
-                ha='center', va='bottom', fontsize=9,
-                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
-                          edgecolor='gray', alpha=0.8))
-        
-        # Labels
-        ax.set_xticks([0, 1])
-        ax.set_xticklabels([f'{ctrl_label}\n(n={len(ctrl_vals)})',
-                            f'{case_label}\n(n={len(case_vals)})'],
-                           fontsize=10)
-        ax.set_ylabel('Ferro-aging Score (ssGSEA)', fontsize=11)
-        ax.set_title(f'{ds_name} ({stat.get("species", "")})', fontsize=12, fontweight='bold')
-        ax.tick_params(axis='both', labelsize=9)
-        
-        # 水平参考线
-        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
-    
-    plt.tight_layout()
-    fig_path = FIG_DIR / 'ferro_aging_scores_boxplot.png'
-    fig.savefig(fig_path, dpi=200, bbox_inches='tight')
-    plt.close()
-    logger.info(f"  箱线图保存: {fig_path}")
-
-
-def plot_forest_plot(meta_df: pd.DataFrame):
-    """绘制Meta分析森林图"""
-    if meta_df.empty:
-        logger.warning("  Meta分析数据为空, 跳过森林图")
-        return
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    y_positions = range(len(meta_df))
-    
-    for i, (_, row) in enumerate(meta_df.iterrows()):
-        is_meta = row.get('dataset', '') == 'META-ANALYSIS'
-        mean = row.get('mean_diff', 0)
-        pval = row.get('pvalue', 1)
-        
-        if is_meta:
-            # META-ANALYSIS行: 使用菱形标记, 不画(无意义的)CI线
-            color = '#2C3E50'
-            ax.scatter(mean, i, marker='D', s=120, color=color, 
-                      edgecolors='white', linewidth=1.5, zorder=6)
-            p_text = f"Meta p={pval:.2e}" if pval > 0.001 else f"Meta p={pval:.1e}"
-            ax.text(mean + 0.08, i, p_text, va='center', fontsize=9,
-                   fontweight='bold', color=color)
-        else:
-            # 单数据集: 使用真实标准差计算95% CI
-            std_case = row.get('std_case', 0)
-            std_control = row.get('std_control', 0)
-            n_case = int(row.get('n_case', 3))
-            n_control = int(row.get('n_control', 3))
-            se = np.sqrt((max(std_case, 0)**2 / max(n_case, 1)) + 
-                         (max(std_control, 0)**2 / max(n_control, 1)))
-            ci_low = mean - 1.96 * max(se, 0.001)
-            ci_high = mean + 1.96 * max(se, 0.001)
-            
-            color = '#E74C3C' if mean > 0 else '#3498DB'
-            ax.scatter(mean, i, color=color, s=80, zorder=5)
-            ax.plot([ci_low, ci_high], [i, i], color=color, linewidth=2, zorder=4)
-            
-            p_text = f"{pval:.2e}" if pval > 0.001 else f"{pval:.1e}"
-            ax.text(ci_high + 0.05, i, f"  p={p_text}", va='center', fontsize=8)
-    
-    ax.axvline(x=0, color='black', linestyle='--', alpha=0.5)
-    ax.set_yticks(list(y_positions))
-    ax.set_yticklabels(meta_df['dataset'].values, fontsize=10)
-    ax.set_xlabel('Ferro-aging Score Difference (Case - Control)', fontsize=11)
-    ax.set_title('Cross-Dataset Meta-Analysis: Ferro-aging in CIRI', 
-                 fontsize=13, fontweight='bold')
-    ax.tick_params(labelsize=9)
-    
-    plt.tight_layout()
-    fig_path = FIG_DIR / 'ferro_aging_forest_plot.png'
-    fig.savefig(fig_path, dpi=200, bbox_inches='tight')
-    plt.close()
-    logger.info(f"  森林图保存: {fig_path}")
 
 
 # ============================================================
@@ -1103,10 +1008,17 @@ def main():
             all_groups[ds_name] = (case_cols, control_cols)
             all_gene_dfs.append(gene_df)
             logger.info(f"  ✓ {ds_name} 处理完成")
+        except FileNotFoundError as e:
+            logger.error(f"  ✗ {ds_name} 数据文件缺失: {e}")
+            continue
+        except ValueError as e:
+            logger.error(f"  ✗ {ds_name} 数据/分组解析错误: {e}")
+            import traceback; traceback.print_exc()
+            continue
         except Exception as e:
-            logger.error(f"  ✗ {ds_name} 处理失败: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"  ✗ {ds_name} 处理失败: [{type(e).__name__}] {e}")
+            import traceback; traceback.print_exc()
+            continue
     
     if not all_stats:
         logger.error("所有数据集处理失败!")
@@ -1132,22 +1044,17 @@ def main():
             'control_label': 'Control',
             'n_case': int(meta_df['n_case'].sum()) if 'n_case' in meta_df.columns else 0,
             'n_control': int(meta_df['n_control'].sum()) if 'n_control' in meta_df.columns else 0,
-            'mean_case': meta_df['mean_case'].mean() if 'mean_case' in meta_df.columns else 0,
-            'mean_control': meta_df['mean_control'].mean() if 'mean_control' in meta_df.columns else 0,
-            'std_case': np.sqrt((meta_df['std_case']**2).sum()) if 'std_case' in meta_df.columns else 0,
-            'std_control': np.sqrt((meta_df['std_control']**2).sum()) if 'std_control' in meta_df.columns else 0,
-            'mean_diff': meta_df['mean_diff'].mean(),
+            'mean_case': np.nan,    # 不报告合并效应量
+            'mean_control': np.nan,  # 仅展示Fisher合并p值
+            'std_case': np.nan,      # 跨数据集不合并标准差
+            'std_control': np.nan,
+            'mean_diff': np.nan,     # 简单平均无加权意义, 不科学
             'pvalue': meta_p,
+            'cohens_d': np.nan,
         }
         meta_df = pd.concat([meta_df, pd.DataFrame([meta_row])], ignore_index=True)
     
     logger.info(f"\n{meta_df[['dataset', 'species', 'n_case', 'n_control', 'mean_diff', 'pvalue']].to_string()}")
-    
-    # ============================================================
-    # 可视化
-    # ============================================================
-    plot_ferro_aging_scores(all_scores, all_stats, all_groups)
-    plot_forest_plot(meta_df)
     
     # ============================================================
     # 输出Excel
@@ -1206,6 +1113,7 @@ def main():
             f.write(f"  {row['case_label']} vs {row['control_label']}\n")
             f.write(f"  n = {row['n_case']} vs {row['n_control']}\n")
             f.write(f"  Ferro-aging score Δ = {row['mean_diff']:.4f}\n")
+            f.write(f"  Cohen's d = {row['cohens_d']:.3f}\n")
             f.write(f"  p = {row['pvalue']:.4e}\n")
         
         f.write("\n\n结论:\n")
@@ -1217,8 +1125,7 @@ def main():
                 continue
             if r['pvalue'] < 0.05:
                 sig_datasets += 1
-        n_sig = sig_datasets
-        f.write(f"在{len(all_stats)}个独立数据集中, {n_sig}个显示铁衰老通路在CIRI中显著激活\n")
+        f.write(f"在{len(all_stats)}个独立数据集中, {sig_datasets}个显示铁衰老通路在CIRI中显著激活\n")
         if 'META-ANALYSIS' in meta_df['dataset'].values:
             mp = meta_df[meta_df['dataset']=='META-ANALYSIS']['pvalue'].values[0]
             f.write(f"跨数据集Meta分析: p = {mp:.4e}\n")
